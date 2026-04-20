@@ -1,0 +1,68 @@
+Consolidate N sibling slow-agent lens outputs for ONE task into a
+unified analysis narrative and a deduplicated findings list. See
+findings-json-format.md for the per-Finding schema.
+
+The input 'lens_outputs' is a list of {lens: {type, name, id, reason},
+analysis: str, findings: [Finding, ...]}. 'task_brief' names the todo
+item this task was started for.
+
+Return JSON only, no fences, no preamble:
+{"analysis": "unified prose narrative", "findings": [<Finding>, ...]}
+
+DEDUP ACROSS LENSES:
+- If multiple lens outputs emit findings describing the same bug
+  (overlapping relevant_symbols / relevant_file_sections / impact),
+  MERGE into a single Finding. Extend summary with detail from each
+  lens, union relevant_symbols and relevant_file_sections (dedup by
+  filename+line), union related_finding_ids, union open_questions.
+  Preserve mechanism_detail and fix_sketch from whichever lens
+  captured them (concatenate with '; ' if both did and they're
+  distinct; otherwise keep the more specific one).
+- Keep the most specific id. If ids disagree, pick the one that
+  best describes the symptom + primary symbol.
+- Preserve severity — use the HIGHEST severity when lenses disagree.
+- If a lens's prose contains '[FLAG → <other-lens>]' but another
+  lens actually emitted a full Finding for that same bug, drop the
+  flag (it was the sibling's job) and keep the full Finding.
+
+COMPLETENESS CHECK — promote prose-only bugs:
+- Before returning, scan every per-lens 'analysis' for bugs that the
+  lens described but NEVER emitted as a Finding. Typical symptoms:
+  a paragraph naming a UAF / race / leak / missing guard in specific
+  code, but no matching id in that lens's findings array OR in the
+  other lenses' arrays.
+- Promote each such bug to a NEW Finding in the unified list. Pull
+  relevant_symbols from whichever lens's prose described it (the
+  symbol bodies are available in 'symbols' / 'context' upstream; the
+  per-lens analyses already quoted them inline — copy those). Fill
+  summary / reproducer_sketch / impact from the prose. Mark severity
+  conservatively. If the prose is too thin to support a Finding (no
+  concrete code path + trigger), leave it in the prose only and do
+  NOT fabricate.
+- Rationale: the merge pass downstream reads ONLY the findings
+  array. Prose-only bugs are lost forever after this step. Promote
+  or demote — never silently drop.
+
+UNIFIED ANALYSIS — prose for the human reader:
+- ONE prose narrative covering the task as a whole, not a
+  concatenation of per-lens sections. Reference Findings by id.
+- Keep observations that didn't rise to actionable-bug status
+  (invariants verified, dead-ends explored, design notes) — those
+  are context for future tasks.
+- Every code reference in this prose MUST be an inline snippet
+  (3-8 lines of actual code), NOT a bare 'filename:line' citation.
+  Format:
+      filename.c:function_name() {
+          ... salient code ...
+      }
+  Pull snippets from the per-lens analyses or from the findings'
+  relevant_symbols / relevant_file_sections. Don't paste entire
+  function bodies — the findings array has those; use the smallest
+  block that makes the point.
+- The Finding records themselves keep their structured schema
+  unchanged (summary / reproducer_sketch / impact with
+  'filename:line' citations plus embedded relevant_symbols). The
+  inline-snippets rule is for the prose analysis ONLY.
+
+Emit only the unified {analysis, findings} pair. Followups are
+already being handled by the caller.

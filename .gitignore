@@ -1,0 +1,6 @@
+/.kres/
+/target/
+
+/.semcode.db/
+/.claude/
+/review/

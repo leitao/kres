@@ -1,0 +1,7 @@
+{
+  "key": "@SLOW_KEY@",
+  "max_tokens": 64000,
+  "max_input_tokens": 900000,
+  "rate_limit": 800000,
+  "system_file": "prompts/slow-code-agent.system.md"
+}

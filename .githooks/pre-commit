@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Pre-commit hook for the kres repo.
+#
+# Runs when the staged changeset touches Rust sources or Cargo
+# manifests. Changes confined to docs/, configs/, or skills/ skip
+# the hook.
+#
+# Checks:
+#   1. `cargo fmt --all --check`  (prints the fix hint on failure).
+#   2. `cargo clippy --workspace --all-targets -- -D warnings`.
+#
+# To install:   git config core.hooksPath .githooks
+
+set -euo pipefail
+
+fail() {
+    echo "pre-commit: $*" >&2
+    exit 1
+}
+
+mapfile -t rust_staged < <(
+    git diff --cached --name-only --diff-filter=ACMR \
+        -- '*.rs' 'Cargo.toml' 'Cargo.lock' '**/Cargo.toml'
+)
+
+if [[ ${#rust_staged[@]} -eq 0 ]]; then
+    exit 0
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+
+echo "pre-commit: rust changes detected (${#rust_staged[@]} file(s))" >&2
+
+# --- cargo fmt --check ------------------------------------------------
+echo "pre-commit: cargo fmt --all --check" >&2
+if ! ( cd "${repo_root}" && cargo fmt --all -- --check ); then
+    cat >&2 <<EOF
+pre-commit: formatting check failed.
+Run:
+    cargo fmt --all && git add -u
+then re-commit. Use --no-verify only if you must bypass.
+EOF
+    exit 1
+fi
+
+# --- cargo clippy -----------------------------------------------------
+echo "pre-commit: cargo clippy --workspace --all-targets -- -D warnings" >&2
+if ! ( cd "${repo_root}" && cargo clippy --workspace --all-targets --quiet -- -D warnings ); then
+    cat >&2 <<EOF
+pre-commit: clippy failed. Fix the warnings and re-commit.
+(Run the full command without --quiet to see the diagnostics.)
+EOF
+    exit 1
+fi
+
+echo "pre-commit: ok" >&2

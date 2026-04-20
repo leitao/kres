@@ -1,0 +1,28 @@
+[package]
+name = "kres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kres"
+path = "src/main.rs"
+
+[dependencies]
+kres-core = { workspace = true }
+kres-llm = { workspace = true }
+kres-mcp = { workspace = true }
+kres-agents = { workspace = true }
+kres-repl = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

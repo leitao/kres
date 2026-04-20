@@ -1,0 +1,7 @@
+{
+  "key": "@FAST_KEY@",
+  "max_tokens": 16384,
+  "rate_limit": 800000,
+  "concurrency": 3,
+  "system_file": "prompts/main-agent.system.md"
+}

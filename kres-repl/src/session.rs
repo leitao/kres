@@ -1,0 +1,2312 @@
+//! REPL session loop.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use tokio::sync::mpsc;
+
+use kres_agents::{AgentConfig, DataFetcher, Orchestrator, RunContext};
+use kres_core::log::TurnLogger;
+use kres_core::{FindingsStore, TaskManager, TaskState, UsageTracker};
+use kres_llm::{client::Client, RateLimiter};
+
+use crate::commands::{parse_command, Command};
+
+#[derive(Debug, Clone)]
+pub struct ReplConfig {
+    pub stop_grace: Duration,
+    /// Path to `findings.json` base (per-turn files written as
+    /// `findings-N.json`). When None, nothing is written to disk.
+    pub findings_base: Option<PathBuf>,
+    /// Stop the REPL after N completed task runs (0 = unlimited).
+    /// Matches semantics.
+    pub turns_limit: u32,
+    /// Per-task append-target for the report markdown (§26). When
+    /// set, every reaped task's analysis lands as a new `## [type]
+    /// name` section with a timestamp. When None, nothing is
+    /// appended — operators can still call `/report PATH` manually.
+    pub report_path: Option<PathBuf>,
+    /// Explicit `--results DIR` from the CLI. Only Some when the
+    /// operator passed --results; defaulted session directories do
+    /// not count. Drives prompt.md persistence and /summary output
+    /// placement — behaviour requested 2026-04-20.
+    pub results_dir: Option<PathBuf>,
+    /// Explicit `--template FILE` from the CLI. Passed through to
+    /// SummaryInputs.template_path when /summary fires. When None
+    /// the summariser falls back to ~/.kres/prompts/bug-summary.md, then
+    /// to the compiled-in default (see kres_repl::summary).
+    pub template_path: Option<PathBuf>,
+    /// When true, skip the persistent status line (no DECSTBM scroll
+    /// region). Useful for dumb terminals / pipes / finicky muxers.
+    pub stdio: bool,
+}
+
+impl Default for ReplConfig {
+    fn default() -> Self {
+        Self {
+            stop_grace: Duration::from_secs(5),
+            findings_base: None,
+            turns_limit: 0,
+            report_path: None,
+            results_dir: None,
+            template_path: None,
+            stdio: false,
+        }
+    }
+}
+
+/// Build a one-line summary of live work for the status bar.
+///
+/// Prefers the in-flight stream registry (agent label + live token
+/// counters) when any stream is active, since those update every
+/// few hundred ms with the actual bytes arriving. Falls back to the
+/// coarser task list when no streams are open (e.g. between turns,
+/// during main-agent tool dispatch).
+///
+/// Each stream segment looks like:
+///   `fast round 2: in=4.2k cr=1.1k rd=3.0k out=812 (12s)`
+/// Everything truncated to fit `max_cols`.
+pub fn render_status_line(snap: &[kres_core::task::TaskSnapshot], max_cols: usize) -> String {
+    use kres_core::TaskState;
+    let streams = kres_core::io::active_streams();
+    if !streams.is_empty() {
+        let segments: Vec<String> = streams
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}: in={} cr={} rd={} out={} ({}s)",
+                    s.label,
+                    fmt_tokens(s.input_tokens),
+                    fmt_tokens(s.cache_creation_tokens),
+                    fmt_tokens(s.cache_read_tokens),
+                    fmt_tokens(s.output_tokens),
+                    s.elapsed_ms / 1000,
+                )
+            })
+            .collect();
+        let body = segments.join(" │ ");
+        let label = format!(" kres │ {} stream(s) │ {}", streams.len(), body);
+        return label.chars().take(max_cols).collect();
+    }
+    let active: Vec<String> = snap
+        .iter()
+        .filter(|t| !matches!(t.state, TaskState::Done | TaskState::Errored))
+        .map(|t| {
+            let state = match t.state {
+                TaskState::Pending => "pending",
+                TaskState::Running => "running",
+                TaskState::Cancelling => "cancelling",
+                TaskState::Done => "done",
+                TaskState::Errored => "errored",
+            };
+            let short_name: String = t.name.chars().take(40).collect();
+            format!("#{} {} {}", t.id, state, short_name)
+        })
+        .collect();
+    let body = if active.is_empty() {
+        "idle".to_string()
+    } else {
+        active.join(" │ ")
+    };
+    let label = format!(" kres ({} task(s)) │ {}", active.len(), body);
+    label.chars().take(max_cols).collect()
+}
+
+/// Compact token display: 1234 → "1.2k", 42 → "42", 1_234_567 → "1.2m".
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}m", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// §21: garble-free async output. The sink lives in `kres_core::io`
+/// so every downstream crate (kres-agents, kres-llm) can route
+/// progress messages through the same channel without a dep on
+/// kres-repl. The REPL installs a rustyline `ExternalPrinter`-backed
+/// handler at startup (see read_stdin); everyone else calls
+/// `kres_core::io::async_println`. Before the handler is installed,
+/// or in non-REPL contexts (kres turn), the fallback goes to stderr.
+pub use kres_core::io::async_println;
+
+pub struct Session {
+    mgr: Arc<TaskManager>,
+    cfg: ReplConfig,
+    orchestrator: Option<Arc<Orchestrator>>,
+    consolidator: Option<Arc<kres_agents::ConsolidatorClient>>,
+    todo_client: Option<Arc<kres_agents::TodoClient>>,
+    goal_client: Option<Arc<kres_agents::GoalClient>>,
+    findings_store: Option<Arc<FindingsStore>>,
+    usage: Arc<UsageTracker>,
+    lenses: Vec<kres_core::LensSpec>,
+    initial_prompt: Option<String>,
+    /// Last reaped task's analysis — consumed by /reply.
+    last_analysis: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Findings loaded from disk at Session::new time. Applied to
+    /// the TaskManager synchronously at the top of `run()` so the
+    /// first submit_prompt observes a non-empty previous_findings.
+    pending_bootstrap: Vec<kres_core::findings::Finding>,
+    /// Per-session turn logger. Created lazily by `with_logger` or
+    /// implicitly in `with_orchestrator` when the caller hasn't set
+    /// one.
+    logger: Option<Arc<TurnLogger>>,
+    /// Per-task completion goals, keyed by TaskId. define_goal's
+    /// result is parked here when submit_prompt spawns a new task;
+    /// the reaper looks it up (and removes it) when that task ends.
+    /// Previously a single Mutex<Option<String>> — that was
+    /// session-wide, so a second submit_prompt overwrote the first
+    /// task's goal before the reaper could check it, causing the
+    /// reaper to compare task-A's analysis against task-B's goal
+    /// (or, if cleared by goal-met, against no goal at all).
+    task_goals: Arc<tokio::sync::Mutex<std::collections::HashMap<kres_core::TaskId, String>>>,
+    /// Per-task original prompt text, keyed by TaskId. Paired with
+    /// task_goals so the reaper can feed both to check_goal. The
+    /// derived goal sometimes compresses sweep intent ("check every
+    /// file") into something narrow the judge trivially marks met;
+    /// passing the raw prompt restores the ground truth.
+    task_prompts: Arc<tokio::sync::Mutex<std::collections::HashMap<kres_core::TaskId, String>>>,
+    /// Accumulated per-task findings — the flat
+    /// `{task, analysis}` list that `/summary` and `/report`
+    /// consume (§6).
+    accumulated: Arc<tokio::sync::Mutex<Vec<AccumulatedEntry>>>,
+    /// Items deferred by goal-met or --turns cap; `/followup` lists
+    /// them (§6).
+    deferred: Arc<tokio::sync::Mutex<Vec<kres_core::TodoItem>>>,
+    /// §22: stashed interrupted prompt. When a ctrl-c lands during a
+    /// long inference, the prompt text moves here so the next
+    /// `/continue` can re-submit it verbatim.
+    interrupted_prompt: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Set to true by the reaper when the --turns cap is reached.
+    /// The main REPL loop checks this after root_shutdown breaks the
+    /// select; when true, /summary is invoked before teardown so the
+    /// operator gets a bug-report.txt on a clean --turns N run.
+    turns_exhausted: Arc<std::sync::atomic::AtomicBool>,
+    /// §50: handles to every spawned MCP child process. On REPL
+    /// exit we walk these and call `shutdown(2s)` on each so
+    /// tracebacks flush cleanly instead of the child getting
+    /// killed mid-write. Matches (...)`
+    /// at.
+    mcp_shutdown: Arc<tokio::sync::Mutex<Vec<Arc<tokio::sync::Mutex<kres_mcp::McpClient>>>>>,
+}
+
+/// One row of the accumulated-findings ledger — matches 's
+/// `_accumulated_findings.append({"task": ..., "analysis": ...})`
+#[derive(Debug, Clone)]
+pub struct AccumulatedEntry {
+    /// Short human label (e.g. `[investigate] scrub drivers/net/...`).
+    pub task: String,
+    pub analysis: String,
+}
+
+impl Session {
+    pub fn new(mgr: Arc<TaskManager>, cfg: ReplConfig) -> Self {
+        // Eagerly create the parent of the findings base so
+        // FindingsStore::new can preflight its probe without the
+        // user having to `mkdir -p` themselves. Matches what
+        // did implicitly by the --results DIR convention.
+        if let Some(ref p) = cfg.findings_base {
+            if let Some(parent) = p.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    kres_core::async_eprintln!(
+                        "findings: cannot create parent dir {}: {e}",
+                        parent.display()
+                    );
+                }
+            }
+        }
+        let findings_store =
+            cfg.findings_base
+                .as_ref()
+                .and_then(|p| match FindingsStore::new(p.clone()) {
+                    Ok(fs) => Some(Arc::new(fs)),
+                    Err(e) => {
+                        kres_core::async_eprintln!(
+                            "findings: store init failed for {}: {e}",
+                            p.display()
+                        );
+                        None
+                    }
+                });
+        if let Some(ref fs) = findings_store {
+            match fs.bootstrap() {
+                Ok(init) => {
+                    let turn_n = init.turn_n;
+                    let count = init.findings.len();
+                    let findings = init.findings;
+                    // Seed the manager synchronously via
+                    // blocking_lock-free futures::executor: the
+                    // ergonomic fix is to hand the findings to
+                    // `run()` which will replace them on the
+                    // first reap tick, BEFORE submit_prompt can
+                    // observe a stale snapshot. To preserve the
+                    // previous behaviour without introducing a
+                    // handle-back API, we store the bootstrap in
+                    // the Session itself.
+                    //
+                    // See `Self::pending_bootstrap` below, consumed
+                    // at the top of `run()`.
+                    kres_core::async_eprintln!(
+                        "findings: initialised at turn {} ({} existing)",
+                        turn_n,
+                        count
+                    );
+                    return Self {
+                        mgr,
+                        cfg,
+                        orchestrator: None,
+                        consolidator: None,
+                        todo_client: None,
+                        goal_client: None,
+                        findings_store,
+                        usage: Arc::new(UsageTracker::new()),
+                        lenses: Vec::new(),
+                        initial_prompt: None,
+                        last_analysis: Arc::new(tokio::sync::Mutex::new(None)),
+                        pending_bootstrap: findings,
+                        logger: None,
+                        task_goals: Arc::new(tokio::sync::Mutex::new(
+                            std::collections::HashMap::new(),
+                        )),
+                        task_prompts: Arc::new(tokio::sync::Mutex::new(
+                            std::collections::HashMap::new(),
+                        )),
+                        accumulated: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                        deferred: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                        interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
+                        turns_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        mcp_shutdown: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                    };
+                }
+                Err(e) => kres_core::async_eprintln!("findings bootstrap: {e}"),
+            }
+        }
+        Self {
+            mgr,
+            cfg,
+            orchestrator: None,
+            consolidator: None,
+            todo_client: None,
+            goal_client: None,
+            findings_store,
+            usage: Arc::new(UsageTracker::new()),
+            lenses: Vec::new(),
+            initial_prompt: None,
+            last_analysis: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_bootstrap: Vec::new(),
+            logger: None,
+            task_goals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            task_prompts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            accumulated: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            deferred: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
+            turns_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            mcp_shutdown: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Register MCP clients for graceful shutdown on REPL exit (§50).
+    pub async fn register_mcp_clients(
+        &self,
+        clients: Vec<Arc<tokio::sync::Mutex<kres_mcp::McpClient>>>,
+    ) {
+        let mut g = self.mcp_shutdown.lock().await;
+        g.extend(clients);
+    }
+
+    /// Attach a TurnLogger. Created once at REPL startup and cloned
+    /// into every agent/merge/todo call site so the session's
+    /// code.jsonl and main.jsonl capture every round-trip.
+    pub fn with_logger(mut self, logger: Arc<TurnLogger>) -> Self {
+        self.logger = Some(logger);
+        self
+    }
+
+    /// Return the session's TurnLogger (if any) — exposed so the
+    /// orchestrator builder can splice it into Orchestrator.logger.
+    pub fn logger(&self) -> Option<Arc<TurnLogger>> {
+        self.logger.clone()
+    }
+
+    pub fn with_consolidator(mut self, c: Arc<kres_agents::ConsolidatorClient>) -> Self {
+        self.consolidator = Some(c);
+        self
+    }
+
+    pub fn with_todo_client(mut self, c: Arc<kres_agents::TodoClient>) -> Self {
+        self.todo_client = Some(c);
+        self
+    }
+
+    /// Attach a GoalClient. Absent → goal system disabled; the
+    /// session runs tasks until --turns / empty-todo-list ('s
+    /// pre-goal behaviour).
+    pub fn with_goal_client(mut self, c: Arc<kres_agents::GoalClient>) -> Self {
+        self.goal_client = Some(c);
+        self
+    }
+
+    /// Snapshot of the accumulated findings ledger. Used by `/report`,
+    /// `/summary`, and the end-of-session write path.
+    pub async fn accumulated_snapshot(&self) -> Vec<AccumulatedEntry> {
+        self.accumulated.lock().await.clone()
+    }
+
+    /// Snapshot of the deferred todos (`/followup`).
+    pub async fn deferred_snapshot(&self) -> Vec<kres_core::TodoItem> {
+        self.deferred.lock().await.clone()
+    }
+
+    pub fn with_prompt_file(mut self, pf: kres_agents::PromptFile) -> Self {
+        self.lenses = pf.lenses;
+        if !pf.prompt.is_empty() {
+            self.initial_prompt = Some(pf.prompt);
+        }
+        self
+    }
+
+    pub fn usage_tracker(&self) -> Arc<UsageTracker> {
+        self.usage.clone()
+    }
+
+    pub fn with_orchestrator(mut self, o: Arc<Orchestrator>) -> Self {
+        self.orchestrator = Some(o);
+        self
+    }
+
+    /// Run the REPL loop.
+    pub async fn run(&self) -> Result<()> {
+        // Apply the bootstrap synchronously BEFORE anything can
+        // submit a prompt, so the first task sees the full
+        // previous_findings list. Was previously tokio::spawn-ed in
+        // Session::new and could race submit_prompt.
+        if !self.pending_bootstrap.is_empty() {
+            self.mgr
+                .replace_findings(self.pending_bootstrap.clone())
+                .await;
+        }
+
+        // Move the sender INTO the input thread so when rustyline
+        // hits EOF (ctrl-d) the only sender drops and the channel
+        // fully closes — otherwise rx.recv() blocks forever waiting
+        // on the retained outer-scope clone and ctrl-d appears to
+        // hang the REPL.
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        tokio::task::spawn_blocking(move || read_stdin(tx));
+
+        // Reserve the bottom two rows for a status bar + prompt.
+        // Scrolling output stays above; status shows what each task
+        // is currently doing. install() returns geometry only when
+        // stderr is a tty and terminal is tall enough (≥3 rows).
+        // --stdio forces the plain path even when stdout is a tty.
+        let status_geom = if self.cfg.stdio {
+            None
+        } else {
+            crate::status::install()
+        };
+        // Shared geometry cell so the paint task and the SIGWINCH
+        // handler both see the same (rows, cols). On resize the
+        // handler re-runs install() and overwrites this.
+        let status_geom_shared: Arc<tokio::sync::RwLock<Option<(u16, u16)>>> =
+            Arc::new(tokio::sync::RwLock::new(status_geom));
+        // Paint task: every 200ms repaint the status row. Every
+        // ~1s (every 5 paint ticks) also poll term_size() — if the
+        // terminal has resized since last check, clear the screen
+        // and reinstall the scroll region at the new geometry.
+        // SIGWINCH turned out unreliable under tmux pane drags
+        // (ghost status lines at the old row), and TIOCGWINSZ is
+        // just a syscall so polling is cheap.
+        let status_handle = if status_geom.is_some() {
+            let mgr_for_status = self.mgr.clone();
+            let geom_for_paint = status_geom_shared.clone();
+            Some(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_millis(200));
+                let mut ticks_since_size_check: u32 = 0;
+                loop {
+                    ticker.tick().await;
+                    ticks_since_size_check += 1;
+                    if ticks_since_size_check >= 5 {
+                        ticks_since_size_check = 0;
+                        let cached = *geom_for_paint.read().await;
+                        let current = crate::status::term_size();
+                        if current != cached {
+                            // Size changed. Preserve scrollback
+                            // content — only wipe the old status
+                            // row (at the CACHED location, which is
+                            // exactly where we last painted it)
+                            // before install() resets the scroll
+                            // region and clears the new row. The
+                            // next paint tick fills the new row
+                            // with fresh content.
+                            if let Some((old_rows, _)) = cached {
+                                crate::status::clear_row_and_reset_region(
+                                    old_rows.saturating_sub(1),
+                                );
+                            }
+                            let new_geom = crate::status::install();
+                            *geom_for_paint.write().await = new_geom;
+                        }
+                    }
+                    let maybe_geom = *geom_for_paint.read().await;
+                    if let Some((rows, cols)) = maybe_geom {
+                        let snap = mgr_for_status.snapshot().await;
+                        let line = render_status_line(&snap, cols as usize);
+                        crate::status::paint(rows, cols, &line);
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+        // SIGWINCH path dropped in favor of term_size polling above.
+        // Kept as Option<JoinHandle> = None so the teardown code
+        // paths compile unchanged.
+        let sigwinch_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+        let root = self.mgr.root_shutdown().clone();
+        let mgr_for_ctrlc = self.mgr.clone();
+        let ctrlc_handle = tokio::spawn(async move {
+            // Each round: wait for ctrl-c, cooperatively cancel, arm a
+            // 3s second-hit window for a hard exit, then loop. The
+            // loop matters: without it the handler returns after the
+            // first round and subsequent ctrl-cs go unhandled, so a
+            // later stuck-inference sequence can no longer be
+            // interrupted.
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    return;
+                }
+                kres_core::async_eprintln!(
+                    "\n(ctrl-c received; cancelling running tasks — hit again to abort)"
+                );
+                // §24: walk the task list and flip any in-progress
+                // todo items BACK to Pending so they get re-queued for
+                // the next /continue. Without this a tasks-were-
+                // running ctrl-c would strand those todos in
+                // "in_progress" forever.
+                {
+                    let items = mgr_for_ctrlc.todo_snapshot().await;
+                    for item in items {
+                        if item.status == kres_core::TodoStatus::InProgress {
+                            mgr_for_ctrlc
+                                .mark_todo_status(&item.name, kres_core::TodoStatus::Pending)
+                                .await;
+                        }
+                    }
+                }
+                root.cancel();
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        kres_core::async_eprintln!("\n(second ctrl-c — aborting)");
+                        std::process::exit(130);
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                }
+            }
+        });
+
+        // Background reaper: every 250ms, drain done/errored tasks,
+        // print a one-line summary, and merge their findings into
+        // the manager's running list.
+        let mgr_for_reaper = self.mgr.clone();
+        let reaper_shutdown = self.mgr.root_shutdown().clone();
+        let last_analysis = self.last_analysis.clone();
+        let todo_client = self.todo_client.clone();
+        let lenses_for_reaper = self.lenses.clone();
+        let logger_for_reaper = self.logger.clone();
+        let goal_client_for_reaper = self.goal_client.clone();
+        let task_goals_for_reaper = self.task_goals.clone();
+        let task_prompts_for_reaper = self.task_prompts.clone();
+        let accumulated_for_reaper = self.accumulated.clone();
+        let deferred_for_reaper = self.deferred.clone();
+        let merger_for_reaper = self.consolidator.clone();
+        let store_for_reaper = self.findings_store.clone();
+        let interrupted_for_reaper = self.interrupted_prompt.clone();
+        let report_path_for_reaper = self.cfg.report_path.clone();
+        let turns_exhausted_for_reaper = self.turns_exhausted.clone();
+        let turns_limit = self.cfg.turns_limit;
+        // §16: findings-signature watchdog. Every successful merge
+        // increments `quiescent` when the merged list's signature
+        // matches the prior one; five consecutive no-change merges
+        // prints the "ANALYSIS CONSIDERED COMPLETE" banner once.
+        let mut last_sig: Vec<(String, String, String, String, usize, usize)> = Vec::new();
+        let mut quiescent: u32 = 0;
+        let mut quiescent_announced = false;
+        let reaper_handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(250));
+            loop {
+                tokio::select! {
+                    _ = reaper_shutdown.cancelled() => break,
+                    _ = ticker.tick() => {}
+                }
+                let reaped = mgr_for_reaper.reap().await;
+                for r in reaped {
+                    report_reaped(&r);
+                    // §22: a task that reaches a terminal state
+                    // (Done or Errored) is no longer interruptable
+                    // — clear the stash so /continue doesn't
+                    // re-submit a completed prompt.
+                    if matches!(r.state, TaskState::Done | TaskState::Errored) {
+                        *interrupted_for_reaper.lock().await = None;
+                    }
+                    if !r.analysis.is_empty() {
+                        let mut la = last_analysis.lock().await;
+                        *la = Some(r.analysis.clone());
+                    }
+
+                    // §6: append every reaped task's
+                    // (task_label, analysis) to the accumulated
+                    // ledger so /summary + /report have the per-
+                    // task narrative to work from.
+                    if !r.analysis.is_empty() {
+                        let entry = AccumulatedEntry {
+                            task: r.name.clone(),
+                            analysis: r.analysis.clone(),
+                        };
+                        accumulated_for_reaper.lock().await.push(entry);
+                        // §26: append the analysis to the report
+                        // markdown (one section per task). The
+                        // accumulated ledger drives `/summary` and
+                        // `/report PATH`; this append mirrors 's
+                        // `_append_report` for an always-up-to-date
+                        // on-disk narrative.
+                        if let Some(ref rp) = report_path_for_reaper {
+                            if let Err(e) =
+                                crate::report::append_task_section(rp, &r.name, &r.analysis)
+                            {
+                                tracing::warn!(
+                                    target: "kres_repl",
+                                    "report append to {}: {e}",
+                                    rp.display()
+                                );
+                            }
+                        }
+                    }
+                    let pre_size = mgr_for_reaper.findings_snapshot().await.len();
+                    let had_delta = !r.findings_delta.is_empty();
+                    if had_delta {
+                        // §16: when a consolidator client is available
+                        // we reuse it as the findings merger too.
+                        // `merge_findings_with_logger` takes a snapshot
+                        // of the current list + the task's delta and
+                        // asks the fast agent for a merged output. The
+                        // with_findings_extract_lock() call serialises
+                        // every merge — 's
+                        // does the same to stop concurrent merges from
+                        // racing.
+                        if let Some(ref merger) = merger_for_reaper {
+                            let current = mgr_for_reaper.findings_snapshot().await;
+                            let delta = r.findings_delta.clone();
+                            let brief = r.name.clone();
+                            let merger_c = merger.clone();
+                            let logger_c = logger_for_reaper.clone();
+                            let merged = mgr_for_reaper
+                                .with_findings_extract_lock(|| async move {
+                                    kres_agents::merge::merge_findings_with_logger(
+                                        merger_c.client.clone(),
+                                        merger_c.model.clone(),
+                                        // Use the dedicated merger
+                                        // system prompt so the model
+                                        // doesn't drift into
+                                        // fast-code-agent mode
+                                        // (returning {"goal":…} or
+                                        // <action> tags) when the
+                                        // embedded MERGER_INSTRUCTIONS
+                                        // in the user message gets
+                                        // under-weighted.
+                                        Some(kres_agents::MERGER_SYSTEM),
+                                        merger_c.max_tokens,
+                                        merger_c.max_input_tokens,
+                                        &brief,
+                                        &delta,
+                                        &current,
+                                        logger_c,
+                                    )
+                                    .await
+                                })
+                                .await;
+                            match merged {
+                                Ok(new_list) => {
+                                    mgr_for_reaper.replace_findings(new_list).await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "kres_repl",
+                                        "merge_findings failed: {e}; applying naive union"
+                                    );
+                                    let mut all = mgr_for_reaper.findings_snapshot().await;
+                                    let existing: std::collections::BTreeSet<String> =
+                                        all.iter().map(|f| f.id.clone()).collect();
+                                    for f in r.findings_delta {
+                                        if !existing.contains(&f.id) {
+                                            all.push(f);
+                                        }
+                                    }
+                                    mgr_for_reaper.replace_findings(all).await;
+                                }
+                            }
+                        } else {
+                            let mut all = mgr_for_reaper.findings_snapshot().await;
+                            let existing: std::collections::BTreeSet<String> =
+                                all.iter().map(|f| f.id.clone()).collect();
+                            for f in r.findings_delta {
+                                if !existing.contains(&f.id) {
+                                    all.push(f);
+                                }
+                            }
+                            mgr_for_reaper.replace_findings(all).await;
+                        }
+                    }
+                    // Persist the CUMULATIVE findings list to disk
+                    // once per reaped task. findings-N.json is the
+                    // complete list of findings still considered
+                    // relevant after this task's delta has been merged
+                    // in — operators reading findings-84.json see the
+                    // full state at turn 84, not just what changed.
+                    // `changed` drives tasks_since_change inside the
+                    // store; quiescent tracking mirrors that signal.
+                    let final_list = mgr_for_reaper.findings_snapshot().await;
+                    let new_sig = findings_signature(&final_list);
+                    let changed = new_sig != last_sig;
+                    last_sig = new_sig;
+                    if changed {
+                        quiescent = 0;
+                        quiescent_announced = false;
+                    } else {
+                        quiescent += 1;
+                        if quiescent >= 5 && !quiescent_announced {
+                            kres_core::async_eprintln!("=== ANALYSIS CONSIDERED COMPLETE ===",);
+                            quiescent_announced = true;
+                        }
+                    }
+                    if had_delta {
+                        kres_core::async_eprintln!(
+                            "[merge] {} finding(s) after merge (delta={} changed={} quiescent={})",
+                            final_list.len(),
+                            final_list.len() as i64 - pre_size as i64,
+                            changed,
+                            quiescent,
+                        );
+                    }
+                    if let Some(ref s) = store_for_reaper {
+                        let to_write = final_list.clone();
+                        let s_c = s.clone();
+                        mgr_for_reaper
+                            .with_findings_extract_lock(|| async move {
+                                if let Err(e) = s_c.write_turn(to_write, changed).await {
+                                    kres_core::async_eprintln!("findings write: {e}");
+                                }
+                            })
+                            .await;
+                    }
+                    // Update todo list via todo-agent when one is
+                    // configured. Non-fatal on any failure — the todo
+                    // list is maintained best-effort.
+                    if let Some(ref tc) = todo_client {
+                        let current = mgr_for_reaper.todo_snapshot().await;
+                        let completed_query = r.name.clone();
+                        let analysis = r.analysis.clone();
+                        let followups = r.followups.clone();
+                        kres_core::async_eprintln!(
+                            "[todo update] before: {} item(s) ({} pending, {} done); {} new followup(s)",
+                            current.len(),
+                            current
+                                .iter()
+                                .filter(|t| t.status == kres_core::TodoStatus::Pending)
+                                .count(),
+                            current
+                                .iter()
+                                .filter(|t| t.status == kres_core::TodoStatus::Done)
+                                .count(),
+                            followups.len(),
+                        );
+                        match kres_agents::update_todo_via_agent_with_logger(
+                            tc,
+                            &completed_query,
+                            &analysis,
+                            &followups,
+                            &current,
+                            &lenses_for_reaper,
+                            logger_for_reaper.clone(),
+                        )
+                        .await
+                        {
+                            Ok(updated) => {
+                                kres_core::async_eprintln!(
+                                    "[todo update] after:  {} item(s) ({} pending, {} done)",
+                                    updated.len(),
+                                    updated
+                                        .iter()
+                                        .filter(|t| t.status == kres_core::TodoStatus::Pending)
+                                        .count(),
+                                    updated
+                                        .iter()
+                                        .filter(|t| t.status == kres_core::TodoStatus::Done)
+                                        .count(),
+                                );
+                                mgr_for_reaper.replace_todo(updated).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "kres_repl",
+                                    "todo-agent update failed: {e}"
+                                );
+                            }
+                        }
+                    }
+
+                    // §4 goal check: if a goal is set, ask the
+                    // main agent whether the current analyses
+                    // satisfy it. When met, every pending todo
+                    // moves to the deferred list and running tasks
+                    // get cancelled so the operator reclaims the
+                    // prompt.
+                    // Goal is now per-task: each reaped task carries
+                    // an id, and submit_prompt parked its goal under
+                    // that id in task_goals. Pull it out (removing so
+                    // it doesn't live forever) and evaluate against
+                    // the accumulated analysis.
+                    let per_task_goal = task_goals_for_reaper.lock().await.remove(&r.id);
+                    let per_task_prompt = task_prompts_for_reaper
+                        .lock()
+                        .await
+                        .remove(&r.id)
+                        .unwrap_or_default();
+                    if let (Some(gc), Some(goal)) = (goal_client_for_reaper.clone(), per_task_goal)
+                    {
+                        let entries = accumulated_for_reaper.lock().await.clone();
+                        kres_core::async_eprintln!(
+                            "[goal check] checking against {} accumulated analysis/es ({}k chars)",
+                            entries.len(),
+                            entries.iter().map(|e| e.analysis.len()).sum::<usize>() / 1000,
+                        );
+                        let mut combined = String::new();
+                        for (i, e) in entries.iter().enumerate() {
+                            if i > 0 {
+                                combined.push_str("\n\n---\n\n");
+                            }
+                            combined.push_str(&format!("## {}\n\n{}", e.task, e.analysis));
+                        }
+                        let check =
+                            kres_agents::check_goal(&gc, &per_task_prompt, &goal, &combined).await;
+                        kres_core::async_eprintln!(
+                            "[goal check] met={} reason={}",
+                            check.met,
+                            truncate(&check.reason, 120)
+                        );
+                        if check.met {
+                            kres_core::async_eprintln!(
+                                "[goal met: {}]",
+                                truncate(&check.reason, 200)
+                            );
+                            // Drain pending todos into the deferred
+                            // ledger so /followup can list them.
+                            let remaining = mgr_for_reaper.todo_snapshot().await;
+                            let mut deferred = deferred_for_reaper.lock().await;
+                            let mut carry = 0usize;
+                            for item in remaining {
+                                if item.status == kres_core::TodoStatus::Pending
+                                    || item.status == kres_core::TodoStatus::Blocked
+                                {
+                                    deferred.push(item);
+                                    carry += 1;
+                                }
+                            }
+                            drop(deferred);
+                            mgr_for_reaper.replace_todo(Vec::new()).await;
+                            if carry > 0 {
+                                kres_core::async_eprintln!(
+                                    "[{carry} pending item(s) moved to deferred — run /followup to list, /continue to pursue]"
+                                );
+                            }
+                            // Per-task goal already removed at the
+                            // top of this branch by .remove(&r.id);
+                            // nothing else to clear.
+                        } else if !check.missing.is_empty() {
+                            kres_core::async_eprintln!(
+                                "[goal not yet met — missing: {}]",
+                                check.missing.join(", ")
+                            );
+                            // Spec in CLAUDE.md: "Goal not met → only
+                            // missing items become followups." Previous
+                            // code only printed the list; the items
+                            // were discarded. Match by
+                            // converting each missing item to a
+                            // 'question'-typed followup and funneling
+                            // them through the todo agent so they get
+                            // deduped against existing items and
+                            // appended as new todos.
+                            if let Some(ref tc) = todo_client {
+                                let reason_prefix = format!(
+                                    "goal not met: {}",
+                                    check.reason.chars().take(100).collect::<String>()
+                                );
+                                let missing_fus: Vec<serde_json::Value> = check
+                                    .missing
+                                    .iter()
+                                    .map(|m| {
+                                        serde_json::json!({
+                                            "type": "question",
+                                            "name": m,
+                                            "reason": reason_prefix,
+                                        })
+                                    })
+                                    .collect();
+                                let current = mgr_for_reaper.todo_snapshot().await;
+                                let completed_query = r.name.clone();
+                                kres_core::async_eprintln!(
+                                    "[goal-not-met → todo update] injecting {} missing item(s) as question followups",
+                                    missing_fus.len()
+                                );
+                                match kres_agents::update_todo_via_agent_with_logger(
+                                    tc,
+                                    &completed_query,
+                                    "",
+                                    &missing_fus,
+                                    &current,
+                                    &lenses_for_reaper,
+                                    logger_for_reaper.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(updated) => {
+                                        kres_core::async_eprintln!(
+                                            "[goal-not-met → todo update] after: {} item(s) ({} pending, {} done)",
+                                            updated.len(),
+                                            updated.iter().filter(|t| t.status == kres_core::TodoStatus::Pending).count(),
+                                            updated.iter().filter(|t| t.status == kres_core::TodoStatus::Done).count(),
+                                        );
+                                        mgr_for_reaper.replace_todo(updated).await;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            target: "kres_repl",
+                                            "todo-agent update (missing items) failed: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // --turns N limit: once the slow-agent run count hits
+                // the configured cap, broadcast cancel so the REPL
+                // exits. Matches 's "stop after N completed task
+                // runs" behaviour.
+                if turns_limit > 0 {
+                    let done = mgr_for_reaper.completed_run_count().await;
+                    if done >= turns_limit {
+                        kres_core::async_eprintln!(
+                            "\n=== --turns {turns_limit} reached — {done} task run(s) completed ==="
+                        );
+                        // §32: move every pending/blocked todo item
+                        // to the deferred list so /followup can list
+                        // them, then clear the todo list. Matches
+                        let remaining = mgr_for_reaper.todo_snapshot().await;
+                        let mut deferred = deferred_for_reaper.lock().await;
+                        let mut carry = 0usize;
+                        for item in remaining {
+                            if matches!(
+                                item.status,
+                                kres_core::TodoStatus::Pending | kres_core::TodoStatus::Blocked
+                            ) {
+                                deferred.push(item);
+                                carry += 1;
+                            }
+                        }
+                        drop(deferred);
+                        mgr_for_reaper.replace_todo(Vec::new()).await;
+                        if carry > 0 {
+                            kres_core::async_eprintln!(
+                                "[{carry} pending item(s) deferred — see /followup]"
+                            );
+                        }
+                        // Flag set BEFORE cancel so the main loop,
+                        // which breaks on root_shutdown.cancelled(),
+                        // sees the flag already asserted when it
+                        // reaches the post-loop /summary gate.
+                        turns_exhausted_for_reaper
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        kres_core::async_eprintln!("exiting REPL.");
+                        mgr_for_reaper.root_shutdown().cancel();
+                        break;
+                    }
+                }
+            }
+        });
+
+        print_banner();
+        if !self.lenses.is_empty() {
+            println!(
+                "installed {} session-wide slow-agent lens(es):",
+                self.lenses.len()
+            );
+            for l in &self.lenses {
+                println!("  [{}] {}", l.kind, l.name);
+            }
+        }
+        if let Some(ref p) = self.initial_prompt {
+            println!("submitting initial prompt from --prompt");
+            self.submit_prompt(p.clone()).await;
+        }
+        let root_shutdown = self.mgr.root_shutdown().clone();
+        let mut auto_continue_idle_since: Option<std::time::Instant> = None;
+        loop {
+            // rustyline prints its own "> " prompt when attached to
+            // a tty; the plain fallback path for piped input doesn't
+            // want a prompt at all. So print_prompt() is gone.
+            //
+            // Also break on root_shutdown cancel so --turns (fired
+            // from the reaper) exits the REPL cleanly.
+            //
+            // §46 auto-continue idle loop: when there are no active
+            // tasks but pending todos, print a 5-second countdown
+            // banner and auto-launch /continue on timeout so long
+            // unattended runs make forward progress without the
+            // operator re-typing. Any input during the window
+            // cancels the auto-continue.
+            // Auto-continue: fire cmd_continue after 5s of
+            // continuous idle-with-pending-deps. Previously a single
+            // `should_auto_continue()` sample before tokio::select!
+            // meant a reaper that added pending items DURING the
+            // select wait couldn't trigger the timer — the sleep
+            // branch was gated by a stale false. Instead, poll the
+            // predicate each second inside the select and maintain
+            // an idle-start timestamp; dispatch when it's been true
+            // for >= AUTO_CONTINUE_IDLE.
+            const AUTO_CONTINUE_IDLE: Duration = Duration::from_secs(5);
+            let line = tokio::select! {
+                _ = root_shutdown.cancelled() => break,
+                l = rx.recv() => {
+                    // Input arrived: reset idle clock.
+                    auto_continue_idle_since = None;
+                    match l {
+                        Some(s) => s,
+                        None => break,
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                    if self.should_auto_continue().await {
+                        let since = auto_continue_idle_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= AUTO_CONTINUE_IDLE {
+                            kres_core::async_eprintln!("[auto-continue: dispatching next batch (hit enter to cancel)]");
+                            self.cmd_continue().await;
+                            auto_continue_idle_since = None;
+                        }
+                    } else {
+                        auto_continue_idle_since = None;
+                    }
+                    continue;
+                }
+            };
+            match parse_command(&line) {
+                Command::Noop => continue,
+                Command::Help => print_help(),
+                Command::Tasks => self.print_tasks().await,
+                Command::Stop => self.cmd_stop().await,
+                Command::Clear => self.cmd_clear().await,
+                Command::Findings => self.print_findings().await,
+                Command::Cost => self.print_cost(),
+                Command::Todo { clear } => {
+                    if clear {
+                        self.cmd_todo_clear().await;
+                    } else {
+                        self.print_todo().await;
+                    }
+                }
+                Command::Followup => self.cmd_followup().await,
+                Command::Summary { filename } => self.cmd_summary(filename).await,
+                Command::Extract {
+                    dir,
+                    report,
+                    todo,
+                    findings,
+                } => self.cmd_extract(dir, report, todo, findings).await,
+                Command::Done { index } => self.cmd_done(index).await,
+                Command::Report { path } => self.cmd_report(path).await,
+                Command::Load { path } => self.cmd_load(path).await,
+                Command::Edit => self.cmd_edit().await,
+                Command::Reply { text } => self.cmd_reply(text).await,
+                Command::Next => self.cmd_next().await,
+                Command::Continue => self.cmd_continue().await,
+                Command::Quit => {
+                    println!("bye");
+                    // Fast-path teardown. Cancel root so every reaper /
+                    // orchestrator / task future awaiting cancellation
+                    // wakes up now (instead of waiting for stop_all to
+                    // individually poke each per-task token). Use a
+                    // short grace — a stuck task shouldn't hold up the
+                    // operator's exit. MCP children die via
+                    // kill_on_drop when the final Arc drops, so the
+                    // 2s-per-server graceful path below is skipped.
+                    self.mgr.root_shutdown().cancel();
+                    let out = self
+                        .mgr
+                        .stop_all(std::time::Duration::from_millis(500))
+                        .await;
+                    if out.requested > 0 {
+                        println!(
+                            "teardown: {}/{} stopped, {} grace-expired",
+                            out.stopped, out.requested, out.grace_expired
+                        );
+                    }
+                    ctrlc_handle.abort();
+                    reaper_handle.abort();
+                    if let Some(h) = status_handle.as_ref() {
+                        h.abort();
+                    }
+                    if let Some(h) = sigwinch_handle.as_ref() {
+                        h.abort();
+                    }
+                    crate::status::restore();
+                    return Ok(());
+                }
+                Command::Unknown(name) => {
+                    println!("unknown command: /{name} (try /help)");
+                }
+                Command::Prompt(text) => {
+                    // submit_prompt awaits define_goal inline before
+                    // spawning the task (goal is used by check_goal
+                    // later). If define_goal is stuck in retries (e.g.
+                    // workspace-wide 429 crunch, up to 20 retries * N
+                    // seconds each) the REPL loop is blind to new
+                    // input and to ctrl-c until that future returns.
+                    // Race it against root_shutdown so ctrl-c actually
+                    // interrupts.
+                    tokio::select! {
+                        _ = self.submit_prompt(text) => {}
+                        _ = root_shutdown.cancelled() => {
+                            kres_core::async_eprintln!("(prompt submission cancelled)");
+                        }
+                    }
+                }
+            }
+        }
+
+        // --turns exit path: reaper flips turns_exhausted when the
+        // slow-agent run count hits cfg.turns_limit, then cancels
+        // root_shutdown to break the REPL loop above. On a clean
+        // --turns run, render a bug-report via /summary before
+        // teardown so the operator gets the artifact without having
+        // to run `kres --summary` afterwards.
+        if self
+            .turns_exhausted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            kres_core::async_eprintln!("--turns: rendering bug-report.txt before exit");
+            self.cmd_summary(None).await;
+        }
+
+        let out = self.mgr.stop_all(self.cfg.stop_grace).await;
+        if out.requested > 0 {
+            println!(
+                "teardown: {}/{} stopped, {} grace-expired",
+                out.stopped, out.requested, out.grace_expired
+            );
+        }
+        ctrlc_handle.abort();
+        reaper_handle.abort();
+        if let Some(h) = status_handle.as_ref() {
+            h.abort();
+        }
+        if let Some(h) = sigwinch_handle.as_ref() {
+            h.abort();
+        }
+        crate::status::restore();
+
+        // §50: walk every registered MCP client and ask for a
+        // graceful shutdown with a 2s grace window. Without this
+        // the children get SIGKILL'd via kill_on_drop(true) when
+        // their `Arc` drops, which loses the last few lines of
+        // stderr logs.
+        let mut registered = self.mcp_shutdown.lock().await;
+        for client in registered.drain(..) {
+            if let Ok(c) = Arc::try_unwrap(client) {
+                let c = c.into_inner();
+                if let Err(e) = c.shutdown(std::time::Duration::from_secs(2)).await {
+                    kres_core::async_eprintln!("mcp shutdown: {e}");
+                }
+            }
+            // If try_unwrap fails the fetcher still holds a clone;
+            // dropping this Arc is enough — kill_on_drop cleans up.
+        }
+        Ok(())
+    }
+
+    async fn submit_prompt(&self, text: String) {
+        let Some(orc) = self.orchestrator.clone() else {
+            println!("(no orchestrator configured — prompt dropped)");
+            println!("hint: rerun `kres repl` with agent configs to enable prompt handling");
+            return;
+        };
+
+        // §44: inline expand any `/load <path>` substring the user
+        // wove into the prompt. Matches. Multiple
+        // references expand; a missing file leaves the `/load …`
+        // text in place and emits an error to the REPL.
+        let text = expand_inline_load(&text);
+
+        // Save the first submitted prompt to <results>/prompt.md so
+        // later runs (re-invocations of `kres --summary` against the
+        // same directory, or this session's own /summary) have the
+        // original question in hand. Only when the operator passed
+        // --results; defaulted ~/.kres/sessions/<ts>/ directories
+        // skip this. Never overwrite an existing prompt.md — /next
+        // and /continue both call submit_prompt for follow-up todo
+        // items, and those are not the original prompt.
+        if let Some(ref dir) = self.cfg.results_dir {
+            let p = dir.join("prompt.md");
+            if !p.exists() {
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    kres_core::async_eprintln!("prompt.md: cannot create {}: {e}", dir.display());
+                } else if let Err(e) = std::fs::write(&p, &text) {
+                    kres_core::async_eprintln!("prompt.md: write {}: {e}", p.display());
+                } else {
+                    kres_core::async_eprintln!("prompt.md: saved to {}", p.display());
+                }
+            }
+        }
+
+        // §22: stash the prompt so a ctrl-c during inference leaves
+        // enough state for /continue to re-submit. Cleared after
+        // spawn — the spawned task owns re-execution from here.
+        *self.interrupted_prompt.lock().await = Some(text.clone());
+
+        // Ask the main agent for a concrete completion goal
+        // ( / §4). Failures fall through to a null
+        // goal; we still run the task, we just skip goal checks.
+        // The goal is parked below against the spawned task's id so
+        // the reaper can pull the right goal for the right task —
+        // with multiple concurrent prompts the previous single
+        // session-wide goal overwrote earlier ones and the reaper
+        // checked task-A's analysis against task-B's goal.
+        let defined_goal: Option<String> = if let Some(gc) = &self.goal_client {
+            match kres_agents::define_goal(gc, &text).await {
+                Some(g) => {
+                    kres_core::async_eprintln!("goal: {}", truncate(&g, 160));
+                    Some(g)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let orc_task = orc.clone();
+        // Snapshot findings BEFORE spawning so the task's
+        // RunContext sees the running list. bugs.md#H1: the read is
+        // cheap and doesn't hold any lock across the API call.
+        let previous_findings = self.mgr.findings_snapshot().await;
+        let task_brief = format!("prompt: {}", truncate(&text, 60));
+        let task_brief_clone = task_brief.clone();
+        let lenses = self.lenses.clone();
+        let consolidator = self.consolidator.clone();
+        let original_prompt = text.clone();
+        let prompt_for_park = text.clone();
+        let task_id = self
+            .mgr
+            .spawn(task_brief, None, move |handle| async move {
+                let ctx = RunContext {
+                    previous_findings,
+                    task_brief: task_brief_clone,
+                    original_prompt,
+                };
+                let res = if lenses.is_empty() {
+                    orc_task
+                        .run_once_with_ctx(&text, &ctx, &handle.shutdown)
+                        .await
+                } else if let Some(c) = consolidator {
+                    orc_task
+                        .run_with_lenses(&text, &lenses, &c, &ctx, &handle.shutdown)
+                        .await
+                } else {
+                    orc_task
+                        .run_once_with_ctx(&text, &ctx, &handle.shutdown)
+                        .await
+                };
+                match res {
+                    Ok(summary) => {
+                        // findings-N.json is written by the reaper
+                        // with the CUMULATIVE merged list (see the
+                        // `findings_store` write site in run()). The
+                        // per-task delta here is carried to the reaper
+                        // via TaskOutcome.findings and fed to the
+                        // merger; the file on disk is the union.
+                        Ok(kres_core::task::TaskOutcome {
+                            analysis: summary.analysis,
+                            findings: summary.findings,
+                            followups: summary
+                                .followups
+                                .iter()
+                                .filter_map(|f| serde_json::to_value(f).ok())
+                                .collect(),
+                        })
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            })
+            .await;
+        // Park the goal under the spawned task's id so the reaper
+        // can pull it when this specific task finishes.
+        if let Some(g) = defined_goal {
+            self.task_goals.lock().await.insert(task_id, g);
+        }
+        // Park the original prompt too — check_goal reads both so
+        // it can weigh the operator's literal intent against the
+        // derived goal string.
+        self.task_prompts
+            .lock()
+            .await
+            .insert(task_id, prompt_for_park);
+        kres_core::async_eprintln!("submitted task #{task_id}");
+    }
+
+    async fn print_tasks(&self) {
+        let snap = self.mgr.snapshot().await;
+        if snap.is_empty() {
+            println!("(no tasks)");
+            return;
+        }
+        println!("{} task(s):", snap.len());
+        for t in snap {
+            let badge = match t.state {
+                TaskState::Pending => "pending",
+                TaskState::Running => "running",
+                TaskState::Cancelling => "cancelling",
+                TaskState::Done => "done",
+                TaskState::Errored => "errored",
+            };
+            println!("  [{:>10}] #{}  {}", badge, t.id, t.name);
+        }
+    }
+
+    async fn print_findings(&self) {
+        let findings = self.mgr.findings_snapshot().await;
+        if findings.is_empty() {
+            println!("(no findings yet)");
+            return;
+        }
+        let (hi, med, lo, crit) = findings.iter().fold((0, 0, 0, 0), |(h, m, l, c), f| {
+            use kres_core::findings::Severity::*;
+            match f.severity {
+                Critical => (h, m, l, c + 1),
+                High => (h + 1, m, l, c),
+                Medium => (h, m + 1, l, c),
+                Low => (h, m, l + 1, c),
+            }
+        });
+        println!(
+            "{} findings: {} critical, {} high, {} medium, {} low",
+            findings.len(),
+            crit,
+            hi,
+            med,
+            lo
+        );
+        for f in findings.iter().take(20) {
+            println!(
+                "  [{:>8?}] {} — {}",
+                f.severity,
+                f.id,
+                truncate(&f.title, 70)
+            );
+        }
+        if findings.len() > 20 {
+            println!("  … {} more", findings.len() - 20);
+        }
+    }
+
+    async fn cmd_stop(&self) {
+        let out = self.mgr.stop_all(self.cfg.stop_grace).await;
+        println!(
+            "/stop: requested={} stopped={} grace_expired={}",
+            out.requested, out.stopped, out.grace_expired
+        );
+    }
+
+    async fn cmd_continue(&self) {
+        use kres_core::TodoStatus;
+        // §22: an interrupted inference wins over batch dispatch.
+        // Re-submit the stashed prompt and return — the operator
+        // gets their work back before new items start.
+        let stashed = self.interrupted_prompt.lock().await.take();
+        if let Some(prompt) = stashed {
+            println!(
+                "/continue: resuming interrupted prompt: {}",
+                truncate(&prompt, 80)
+            );
+            self.submit_prompt(prompt).await;
+            return;
+        }
+        // Pull any deferred items (from goal-met or --turns drains)
+        // back into the active todo list as Pending so they get
+        // dispatched here. The "/continue to pursue" message we
+        // print on goal-met implies this will happen; without it
+        // the operator has to re-type every deferred item by hand.
+        {
+            let mut deferred = self.deferred.lock().await;
+            if !deferred.is_empty() {
+                let carry = deferred.len();
+                let mut items = self.mgr.todo_snapshot().await;
+                let existing: std::collections::BTreeSet<String> =
+                    items.iter().map(|i| i.name.clone()).collect();
+                for mut d in deferred.drain(..) {
+                    if existing.contains(&d.name) {
+                        continue;
+                    }
+                    d.status = TodoStatus::Pending;
+                    items.push(d);
+                }
+                self.mgr.replace_todo(items).await;
+                println!("/continue: pulled {carry} deferred item(s) into todo list");
+            }
+        }
+        // §15: cap the batch at 10 items per `/continue` to match
+        //Items beyond the cap stay pending so the
+        // operator can re-issue /continue or let the auto-continue
+        // idle loop pick them up.
+        const BATCH_CAP: usize = 10;
+        let items = self.mgr.todo_snapshot().await;
+        let done: std::collections::BTreeSet<String> = items
+            .iter()
+            .filter(|i| i.status == TodoStatus::Done)
+            .map(|i| i.name.clone())
+            .collect();
+        let mut dispatched = 0usize;
+        let mut blocked = 0usize;
+        let mut remaining = 0usize;
+        for item in &items {
+            if item.status != TodoStatus::Pending {
+                continue;
+            }
+            if !item.depends_on.iter().all(|d| done.contains(d)) {
+                blocked += 1;
+                continue;
+            }
+            if dispatched >= BATCH_CAP {
+                remaining += 1;
+                continue;
+            }
+            let prompt = if item.reason.is_empty() {
+                format!("[{}] {}", item.kind, item.name)
+            } else {
+                format!("[{}] {}: {}", item.kind, item.name, item.reason)
+            };
+            self.mgr
+                .mark_todo_status(&item.name, TodoStatus::InProgress)
+                .await;
+            self.submit_prompt(prompt).await;
+            dispatched += 1;
+        }
+        let mut msg = format!("/continue: dispatched {dispatched} item(s)");
+        if blocked > 0 {
+            msg.push_str(&format!(", {blocked} blocked on unfinished deps"));
+        }
+        if remaining > 0 {
+            msg.push_str(&format!(
+                ", {remaining} left — /continue again to process next batch"
+            ));
+        }
+        println!("{msg}");
+    }
+
+    async fn cmd_next(&self) {
+        use kres_core::TodoStatus;
+        let items = self.mgr.todo_snapshot().await;
+        // Pick the first item whose dependencies are all done.
+        let done: std::collections::BTreeSet<String> = items
+            .iter()
+            .filter(|i| i.status == TodoStatus::Done)
+            .map(|i| i.name.clone())
+            .collect();
+        let next = items.iter().find(|i| {
+            i.status == TodoStatus::Pending && i.depends_on.iter().all(|d| done.contains(d))
+        });
+        let Some(item) = next else {
+            let pending = items
+                .iter()
+                .filter(|i| i.status == TodoStatus::Pending)
+                .count();
+            if pending == 0 {
+                println!("/next: nothing pending");
+            } else {
+                println!(
+                    "/next: {} pending item(s) but all are blocked on unfinished deps",
+                    pending
+                );
+            }
+            return;
+        };
+        let prompt = if item.reason.is_empty() {
+            format!("[{}] {}", item.kind, item.name)
+        } else {
+            format!("[{}] {}: {}", item.kind, item.name, item.reason)
+        };
+        // Mark as in-progress so a second /next doesn't re-dispatch
+        // the same item while this one is still running.
+        self.mgr
+            .mark_todo_status(&item.name, TodoStatus::InProgress)
+            .await;
+        println!("/next: dispatching {}", truncate(&item.name, 80));
+        self.submit_prompt(prompt).await;
+    }
+
+    async fn cmd_edit(&self) {
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+        let tmp = std::env::temp_dir().join(format!(
+            "kres-edit-{}-{}.md",
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis()
+        ));
+        if let Err(e) = std::fs::write(&tmp, "") {
+            println!("/edit: create tempfile: {e}");
+            return;
+        }
+        // Handing the terminal to the editor requires blocking on
+        // its status. spawn_blocking keeps the runtime alive.
+        let editor_path = tmp.clone();
+        let editor_cmd = editor.clone();
+        let status = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(editor_cmd)
+                .arg(&editor_path)
+                .status()
+        })
+        .await;
+        // Trust the tempfile contents regardless of editor exit code.
+        // A `:wq!` forced-quit or the
+        // user saving and escaping without a clean exit shouldn't
+        // discard the typed prompt. Match that here; only a spawn
+        // failure (editor binary missing) drops the content.
+        let content = match status {
+            Ok(Ok(_)) => std::fs::read_to_string(&tmp).ok(),
+            Ok(Err(e)) => {
+                println!("/edit: editor spawn failed: {e}");
+                None
+            }
+            Err(e) => {
+                println!("/edit: join error: {e}");
+                None
+            }
+        };
+        // bugs.md#L6: always clean up the tempfile, even on editor
+        // failure, to avoid /tmp accretion.
+        let _ = std::fs::remove_file(&tmp);
+        let Some(text) = content else { return };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            println!("/edit: empty, nothing submitted");
+            return;
+        }
+        self.submit_prompt(trimmed.to_string()).await;
+    }
+
+    async fn cmd_reply(&self, text: String) {
+        let prior = {
+            let g = self.last_analysis.lock().await;
+            g.clone()
+        };
+        let combined = match (prior, text.trim().is_empty()) {
+            (Some(p), false) => format!("{}\n\n{}", p, text),
+            (Some(p), true) => p,
+            (None, false) => {
+                println!("/reply: no prior analysis — submitting plain text");
+                text
+            }
+            (None, true) => {
+                println!("/reply: no prior analysis and no new text — nothing to do");
+                return;
+            }
+        };
+        self.submit_prompt(combined).await;
+    }
+
+    async fn cmd_load(&self, path: String) {
+        if path.is_empty() {
+            println!("usage: /load <path>");
+            return;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    println!("/load: {} is empty", path);
+                    return;
+                }
+                println!("/load: submitting {} chars from {}", trimmed.len(), path);
+                self.submit_prompt(trimmed.to_string()).await;
+            }
+            Err(e) => println!("/load: {}: {e}", path),
+        }
+    }
+
+    async fn cmd_report(&self, path: String) {
+        if path.is_empty() {
+            println!("usage: /report <path>.md");
+            return;
+        }
+        let findings = self.mgr.findings_snapshot().await;
+        match crate::report::write_findings_to_file(&findings, std::path::Path::new(&path)) {
+            Ok(()) => println!("/report: wrote {} finding(s) to {}", findings.len(), path),
+            Err(e) => println!("/report: {}: {e}", path),
+        }
+    }
+
+    /// `/followup` — list items deferred by a goal-met or --turns
+    /// cap. Matches command.
+    async fn cmd_followup(&self) {
+        let def = self.deferred.lock().await;
+        if def.is_empty() {
+            println!("(no deferred items)");
+            return;
+        }
+        println!("deferred ({}):", def.len());
+        for (i, item) in def.iter().enumerate() {
+            println!(
+                "  {:3}. [{}] {}  ({})",
+                i + 1,
+                item.kind,
+                truncate(&item.name, 80),
+                match item.status {
+                    kres_core::TodoStatus::Pending => "pending",
+                    kres_core::TodoStatus::InProgress => "in-progress",
+                    kres_core::TodoStatus::Blocked => "blocked",
+                    kres_core::TodoStatus::Done => "done",
+                    kres_core::TodoStatus::Skipped => "skipped",
+                }
+            );
+            if !item.reason.is_empty() {
+                println!("       — {}", truncate(&item.reason, 120));
+            }
+        }
+    }
+
+    /// `/summary` — synthesise every `(task, analysis)` entry in the
+    /// accumulated ledger into a single markdown narrative.
+    ///
+    /// The calls the main agent to generate a smart
+    /// synthesis; kres currently produces a deterministic concatenation
+    /// (TODO: add an LLM synthesiser once the summariser agent config
+    /// is defined). Matches the shape of `/summary` at.
+    async fn cmd_summary(&self, filename: Option<String>) {
+        let Some(orc) = self.orchestrator.as_ref() else {
+            async_println(
+                "/summary: orchestrator not configured (need --fast-agent and --slow-agent)",
+            );
+            return;
+        };
+        let Some(report_path) = self.cfg.report_path.clone() else {
+            async_println("/summary: no report path configured");
+            return;
+        };
+        if !report_path.exists() {
+            async_println(format!(
+                "/summary: {} does not exist yet — run at least one task",
+                report_path.display()
+            ));
+            return;
+        }
+        // Output goes to the explicit --results dir when the operator
+        // set one (so prompt.md, findings.json, report.md, and
+        // bug-report.txt all live together). Without --results, fall
+        // back to the report.md's parent — that's still inside the
+        // defaulted ~/.kres/sessions/<ts>/ tree, just not flagged as
+        // operator-chosen.
+        let output_dir = self
+            .cfg
+            .results_dir
+            .clone()
+            .or_else(|| report_path.parent().map(std::path::Path::to_path_buf));
+        let output_path =
+            crate::summary::default_output_path(output_dir.as_deref(), filename.as_deref());
+        let findings_path = self.cfg.findings_base.clone();
+        // Original prompt resolution: in-memory initial_prompt wins
+        // (it's the literal --prompt FILE or first submission). If
+        // that's empty, look for prompt.md in the results dir; the
+        // submit_prompt path saves the first prompt there when
+        // --results was configured.
+        let original_prompt = match self.initial_prompt.clone() {
+            Some(s) if !s.trim().is_empty() => Some(s),
+            _ => self.cfg.results_dir.as_ref().and_then(|d| {
+                let p = d.join("prompt.md");
+                std::fs::read_to_string(&p).ok().and_then(|s| {
+                    if s.trim().is_empty() {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                })
+            }),
+        };
+        let inputs = crate::summary::SummaryInputs {
+            report_path,
+            findings_path,
+            output_path: output_path.clone(),
+            template_path: self.cfg.template_path.clone(),
+            original_prompt,
+            client: orc.fast_client.clone(),
+            model: orc.fast_model.clone(),
+            max_tokens: orc.fast_max_tokens,
+            max_input_tokens: orc.fast_max_input_tokens,
+        };
+        async_println(format!(
+            "/summary: rendering bug report to {}",
+            output_path.display()
+        ));
+        if let Err(e) = crate::summary::run_summary(inputs).await {
+            async_println(format!("/summary: {e}"));
+        }
+    }
+
+    /// `/extract [--dir D] [--report F] [--todo F] [--findings F]` —
+    /// copy session artifacts to operator-chosen destinations. Matches
+    async fn cmd_extract(
+        &self,
+        dir: Option<String>,
+        report: Option<String>,
+        todo: Option<String>,
+        findings: Option<String>,
+    ) {
+        // Decide destination for each artifact. --dir sets a
+        // baseline destination directory; per-file flags override.
+        let dir_buf = dir.as_ref().map(std::path::PathBuf::from);
+        if let Some(ref d) = dir_buf {
+            if let Err(e) = std::fs::create_dir_all(d) {
+                println!("/extract: create {}: {e}", d.display());
+                return;
+            }
+        }
+        let resolve = |name: &str, override_: Option<&String>| -> Option<std::path::PathBuf> {
+            if let Some(p) = override_ {
+                return Some(std::path::PathBuf::from(p));
+            }
+            dir_buf.as_ref().map(|d| d.join(name))
+        };
+        // Report: take the findings list and dump it.
+        if let Some(p) = resolve("report.md", report.as_ref()) {
+            let findings = self.mgr.findings_snapshot().await;
+            match crate::report::write_findings_to_file(&findings, &p) {
+                Ok(()) => println!(
+                    "/extract: wrote {} finding(s) to {}",
+                    findings.len(),
+                    p.display()
+                ),
+                Err(e) => println!("/extract: report {}: {e}", p.display()),
+            }
+        }
+        // Todo: write current todo list (pending+done) as markdown.
+        if let Some(p) = resolve("todo.md", todo.as_ref()) {
+            let items = self.mgr.todo_snapshot().await;
+            let mut md = String::from("# Todo\n\n");
+            for item in &items {
+                let check = if item.status == kres_core::TodoStatus::Done {
+                    "x"
+                } else {
+                    " "
+                };
+                md.push_str(&format!("- [{check}] **[{}]** {}", item.kind, item.name));
+                if !item.reason.is_empty() {
+                    md.push_str(&format!(" — {}", item.reason));
+                }
+                md.push('\n');
+            }
+            match std::fs::write(&p, md) {
+                Ok(()) => println!("/extract: wrote {} todo(s) to {}", items.len(), p.display()),
+                Err(e) => println!("/extract: todo {}: {e}", p.display()),
+            }
+        }
+        // Findings: dump the structured JSON.
+        if let Some(p) = resolve("findings.json", findings.as_ref()) {
+            let list = self.mgr.findings_snapshot().await;
+            match serde_json::to_string_pretty(&list) {
+                Ok(s) => match std::fs::write(&p, s) {
+                    Ok(()) => println!(
+                        "/extract: wrote {} finding(s) to {}",
+                        list.len(),
+                        p.display()
+                    ),
+                    Err(e) => println!("/extract: findings {}: {e}", p.display()),
+                },
+                Err(e) => println!("/extract: findings serialise: {e}"),
+            }
+        }
+    }
+
+    /// `/done N` — remove the N'th (1-based) pending todo item.
+    async fn cmd_done(&self, index: usize) {
+        if index == 0 {
+            println!("/done: 1-based index expected");
+            return;
+        }
+        let items = self.mgr.todo_snapshot().await;
+        let pending: Vec<&kres_core::TodoItem> = items
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.status,
+                    kres_core::TodoStatus::Pending | kres_core::TodoStatus::Blocked
+                )
+            })
+            .collect();
+        if index > pending.len() {
+            println!(
+                "/done: index {} out of range ({} pending)",
+                index,
+                pending.len()
+            );
+            return;
+        }
+        let target_name = pending[index - 1].name.clone();
+        let new_list: Vec<kres_core::TodoItem> = items
+            .into_iter()
+            .filter(|t| t.name != target_name)
+            .collect();
+        self.mgr.replace_todo(new_list).await;
+        println!("/done: removed {}", truncate(&target_name, 80));
+    }
+
+    /// §46: decide whether the idle loop should auto-launch a
+    /// `/continue` on timeout. Conditions (mirroring):
+    /// no active tasks, at least one pending todo, and at least one
+    /// pending item whose deps are satisfied.
+    async fn should_auto_continue(&self) -> bool {
+        use kres_core::TodoStatus;
+        let running = self.mgr.active_count().await;
+        if running > 0 {
+            return false;
+        }
+        let items = self.mgr.todo_snapshot().await;
+        let done: std::collections::BTreeSet<String> = items
+            .iter()
+            .filter(|i| i.status == TodoStatus::Done)
+            .map(|i| i.name.clone())
+            .collect();
+        items.iter().any(|i| {
+            i.status == TodoStatus::Pending && i.depends_on.iter().all(|d| done.contains(d))
+        })
+    }
+
+    /// `/todo --clear` — drop every todo item.
+    async fn cmd_todo_clear(&self) {
+        self.mgr.replace_todo(Vec::new()).await;
+        println!("/todo: cleared");
+    }
+
+    async fn print_todo(&self) {
+        use kres_core::TodoStatus;
+        let items = self.mgr.todo_snapshot().await;
+        if items.is_empty() {
+            println!("(todo list empty)");
+            return;
+        }
+        let pending = items
+            .iter()
+            .filter(|i| i.status == TodoStatus::Pending)
+            .count();
+        let running = items
+            .iter()
+            .filter(|i| i.status == TodoStatus::InProgress)
+            .count();
+        let done = items
+            .iter()
+            .filter(|i| i.status == TodoStatus::Done)
+            .count();
+        println!(
+            "{} todo item(s): {} pending, {} running, {} done",
+            items.len(),
+            pending,
+            running,
+            done
+        );
+        for i in items.iter().take(30) {
+            let badge = match i.status {
+                TodoStatus::Pending => "pending",
+                TodoStatus::InProgress => "running",
+                TodoStatus::Done => "done",
+                TodoStatus::Blocked => "blocked",
+                TodoStatus::Skipped => "skipped",
+            };
+            println!("  [{:>7}] [{}] {}", badge, i.kind, i.name);
+        }
+        if items.len() > 30 {
+            println!("  … {} more", items.len() - 30);
+        }
+    }
+
+    fn print_cost(&self) {
+        let snap = self.usage.snapshot();
+        if snap.is_empty() {
+            println!("(no API usage recorded yet)");
+            return;
+        }
+        let total = self.usage.totals();
+        // Show per-row input/output and cache-create/cache-read,
+        // plus a total line.
+        println!("usage ({} call(s) total):", total.calls);
+        for (k, e) in &snap {
+            println!(
+                "  {:>4}/{:<24}  {:>4}×  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
+                k.role,
+                k.model,
+                e.calls,
+                fmt_k(e.input_tokens),
+                fmt_k(e.output_tokens),
+                fmt_k(e.cache_creation_input_tokens),
+                fmt_k(e.cache_read_input_tokens),
+            );
+        }
+        println!(
+            "  total         {:>4}×  in={:>9}  out={:>9}  cache_create={:>9}  cache_read={:>9}",
+            total.calls,
+            fmt_k(total.input_tokens),
+            fmt_k(total.output_tokens),
+            fmt_k(total.cache_creation_input_tokens),
+            fmt_k(total.cache_read_input_tokens),
+        );
+    }
+
+    async fn cmd_clear(&self) {
+        // bugs.md#C2: cancel first, reset state after.
+        let out = self.mgr.stop_all(self.cfg.stop_grace).await;
+        self.mgr.replace_findings(vec![]).await;
+        self.mgr.replace_todo(vec![]).await;
+        println!(
+            "/clear: stopped {} task(s), reset findings + todo",
+            out.stopped + out.grace_expired
+        );
+    }
+}
+
+/// Convenience: build an Orchestrator from paths to agent configs and
+/// a workspace directory. The DataFetcher is a WorkspaceFetcher over
+/// the given workspace; MCP integration is a Phase 8 add-on.
+/// Built components from a pair of agent configs.
+///
+/// The Orchestrator is the task runner; the ConsolidatorClient is the
+/// fast-agent-flavoured LLM handle used by `run_with_lenses` to merge
+/// N parallel lens outputs into a unified analysis + deduplicated
+/// findings list.
+pub struct BuiltAgents {
+    pub orchestrator: Arc<Orchestrator>,
+    pub consolidator: Arc<kres_agents::ConsolidatorClient>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn build_orchestrator(
+    fast_cfg_path: &Path,
+    slow_cfg_path: &Path,
+    workspace: impl Into<PathBuf>,
+    fetcher: Arc<dyn DataFetcher>,
+    skills: Option<serde_json::Value>,
+    usage: Option<Arc<UsageTracker>>,
+    gather_turns: u8,
+    logger: Option<Arc<TurnLogger>>,
+    settings: &crate::settings::Settings,
+) -> Result<BuiltAgents> {
+    let fast_cfg = AgentConfig::load(fast_cfg_path)
+        .with_context(|| format!("loading fast agent config {}", fast_cfg_path.display()))?;
+    let slow_cfg = AgentConfig::load(slow_cfg_path)
+        .with_context(|| format!("loading slow agent config {}", slow_cfg_path.display()))?;
+
+    let fast_key = fast_cfg.key.clone();
+    let slow_key = slow_cfg.key.clone();
+
+    let fast_model = crate::settings::pick_model(
+        fast_cfg.model.as_deref(),
+        crate::settings::ModelRole::Fast,
+        settings,
+    );
+    let slow_model = crate::settings::pick_model(
+        slow_cfg.model.as_deref(),
+        crate::settings::ModelRole::Slow,
+        settings,
+    );
+
+    // Shared rate limiter keyed by API-key string: agents using the
+    // same key share a bucket so they can't collectively burst past
+    // the per-key server limit. Capacity comes from whichever config
+    // was read first for that key. (Previously keyed on key_file
+    // path; now that keys are inline in the config we key on the key
+    // string itself, which is equivalent when two configs share a
+    // key and correctly separate when they don't.)
+    let mut limiters: std::collections::HashMap<String, Arc<RateLimiter>> =
+        std::collections::HashMap::new();
+    let fast_limiter = fast_cfg
+        .rate_limit
+        .and_then(|c| RateLimiter::new(c as u64))
+        .inspect(|r| {
+            limiters.insert(fast_key.clone(), r.clone());
+        });
+    let slow_limiter = if fast_key == slow_key {
+        fast_limiter.clone()
+    } else {
+        slow_cfg
+            .rate_limit
+            .and_then(|c| RateLimiter::new(c as u64))
+            .inspect(|r| {
+                limiters.insert(slow_key.clone(), r.clone());
+            })
+    };
+    let _ = limiters;
+
+    let fast_client = Arc::new(
+        Client::builder(fast_key)
+            .rate_limiter(fast_limiter)
+            .build()?,
+    );
+    let slow_client = Arc::new(
+        Client::builder(slow_key)
+            .rate_limiter(slow_limiter)
+            .build()?,
+    );
+
+    let _workspace = workspace.into(); // retained by caller; fetcher already knows.
+
+    let consolidator = Arc::new(kres_agents::ConsolidatorClient {
+        client: fast_client.clone(),
+        model: fast_model.clone(),
+        system: fast_cfg.system.clone(),
+        max_tokens: fast_cfg
+            .max_tokens
+            .unwrap_or(fast_model.max_output_tokens)
+            .min(32_000),
+        max_input_tokens: fast_cfg.max_input_tokens,
+    });
+
+    let orchestrator = Arc::new(Orchestrator {
+        fast_client,
+        fast_model: fast_model.clone(),
+        fast_system: fast_cfg.system,
+        fast_max_tokens: fast_cfg.max_tokens.unwrap_or(fast_model.max_output_tokens),
+        fast_max_input_tokens: fast_cfg.max_input_tokens,
+        slow_client,
+        slow_model: slow_model.clone(),
+        slow_system: slow_cfg.system,
+        slow_max_tokens: slow_cfg.max_tokens.unwrap_or(slow_model.max_output_tokens),
+        slow_max_input_tokens: slow_cfg.max_input_tokens,
+        fetcher,
+        max_fast_rounds: gather_turns,
+        skills,
+        usage,
+        logger,
+    });
+
+    Ok(BuiltAgents {
+        orchestrator,
+        consolidator,
+    })
+}
+
+/// Print a one-line summary of a reaped task.
+fn report_reaped(r: &kres_core::ReapedTask) {
+    match r.state {
+        kres_core::TaskState::Done => {
+            println!(
+                "== done #{} {} ({} findings, {} char analysis)",
+                r.id,
+                truncate(&r.name, 60),
+                r.findings_delta.len(),
+                r.analysis.len(),
+            );
+            // Print the analysis body. Previously only a one-line
+            // summary reached the screen, so an operator who didn't
+            // know about /summary would see agent-traffic lines fly
+            // past and then ... nothing. Full body on stdout matches
+            // the 's behaviour.
+            if !r.analysis.is_empty() {
+                println!();
+                println!("{}", r.analysis);
+                println!();
+            }
+        }
+        kres_core::TaskState::Errored => {
+            println!(
+                "== error #{} {} — {}",
+                r.id,
+                truncate(&r.name, 60),
+                r.error.as_deref().unwrap_or("(no error text)")
+            );
+        }
+        _ => {}
+    }
+}
+
+fn read_stdin(tx: mpsc::UnboundedSender<String>) {
+    // rustyline: line-editing + ^R history search + arrow-key recall.
+    // History persists to $HOME/.kres/history. Falls back to plain
+    // stdin on any rustyline init failure so a weird terminal doesn't
+    // brick the REPL.
+    use rustyline::{Cmd, KeyCode, KeyEvent, Modifiers};
+
+    let history_path = dirs::home_dir().map(|h| h.join(".kres").join("history"));
+    let mut editor = match rustyline::DefaultEditor::new() {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(target: "kres_repl", "rustyline init failed: {err}; falling back");
+            return read_stdin_plain(tx);
+        }
+    };
+    // §21: install a global printer channel so async sites can push
+    // lines through rustyline's ExternalPrinter without redrawing
+    // over the in-progress buffer. The handler is registered into
+    // kres_core::io so agents/llm crates can reach it via
+    // async_println without a kres-repl dep.
+    if let Ok(mut printer) = editor.create_external_printer() {
+        let (ptx, mut prx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let _ = kres_core::io::install_printer(Box::new(move |s| {
+            let _ = ptx.send(s);
+        }));
+        std::thread::spawn(move || {
+            use tokio::runtime::Handle;
+            let handle = Handle::try_current().ok();
+            let drain = async move {
+                while let Some(line) = prx.recv().await {
+                    use rustyline::ExternalPrinter as _;
+                    if let Err(e) = printer.print(format!("{line}\n")) {
+                        kres_core::async_eprintln!("external printer: {e}\n{line}");
+                    }
+                }
+            };
+            if let Some(h) = handle {
+                h.block_on(drain);
+            } else {
+                // Best-effort fallback when no tokio runtime is
+                // reachable from this thread.
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                if let Ok(rt) = rt {
+                    rt.block_on(drain);
+                }
+            }
+        });
+    }
+    // §43: Ctrl-G submits `/edit` so the operator can open $EDITOR
+    // on a scratch file. Matches \C-a\C-k/edit\C-m` binding
+    // at. rustyline lets us bind a single
+    // key-event to either a Cmd::Insert-then-AcceptLine sequence or
+    // a dedicated command — we approximate by binding Ctrl-G to
+    // "kill line, insert /edit, accept". The sequence is expressed
+    // as a chain by calling bind_sequence repeatedly.
+    editor.bind_sequence(
+        KeyEvent::new('g', Modifiers::CTRL),
+        Cmd::Insert(1, "/edit".to_string()),
+    );
+    // §43: also honour Shift-Enter / Alt-Enter / CSI-u forms as
+    // literal-newline inputs so multi-line prompts work without
+    // submit. rustyline binds to Cmd::Newline.
+    for key in [
+        KeyEvent(KeyCode::Enter, Modifiers::SHIFT),
+        KeyEvent(KeyCode::Enter, Modifiers::ALT),
+    ] {
+        editor.bind_sequence(key, Cmd::Newline);
+    }
+    if let Some(ref p) = history_path {
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = editor.load_history(p);
+    }
+    loop {
+        match editor.readline("> ") {
+            Ok(line) => {
+                if !line.trim().is_empty() {
+                    let _ = editor.add_history_entry(line.as_str());
+                }
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                // Ctrl-C at the prompt: send empty line; the outer
+                // Ctrl-C handler in run() already handles cancel.
+                let _ = tx.send(String::new());
+            }
+            Err(rustyline::error::ReadlineError::Eof) => break,
+            Err(_) => break,
+        }
+    }
+    if let Some(ref p) = history_path {
+        let _ = editor.save_history(p);
+    }
+}
+
+/// Fallback reader when rustyline can't initialise (non-tty stdin
+/// under `echo ... | kres repl`, or exotic terminals).
+fn read_stdin_plain(tx: mpsc::UnboundedSender<String>) {
+    use std::io::BufRead as _;
+    let stdin = std::io::stdin();
+    let mut lock = stdin.lock();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match lock.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let s = line.trim_end_matches(['\r', '\n']).to_string();
+                if tx.send(s).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn print_banner() {
+    // §34: banner parity with. Session/logs/agent
+    // lines are printed to stderr by the caller before run() starts
+    // (see main.rs). Here we emit the header + the quick-command
+    // hint — the per-run context (skills, artifacts dir, etc.) is
+    // already on stderr by the time the REPL loop starts.
+    println!("kres — kernel code research agent");
+    println!("type /help for commands, /quit to exit");
+    println!("ctrl-g: editor  |  /clear: reset  |  /quit: exit");
+}
+
+fn print_help() {
+    println!("commands:");
+    println!("  /help, /?        show this help");
+    println!("  /tasks, /task    list running tasks");
+    println!("  /findings        summarise findings");
+    println!("  /stop            cancel running tasks");
+    println!("  /clear           stop tasks and reset findings + todo");
+    println!("  /cost            show API token usage");
+    println!("  /todo            show the todo list");
+    println!("  /report <path>   write findings report (markdown)");
+    println!("  /load <path>     submit a file's contents as the next prompt");
+    println!("  /edit            open $EDITOR on a scratch file, submit on save");
+    println!("  /followup        list items deferred by goal/--turns");
+    println!("  /summary [FILE]  render report.md+findings.json into a plain-text bug report (default bug-report.txt)");
+    println!("  /extract ...     copy artifacts (--dir, --report, --todo, --findings)");
+    println!("  /done N          remove the N'th pending todo");
+    println!("  /todo --clear    drop every todo item");
+    println!("  /reply <text>    prepend last analysis to new text, submit");
+    println!("  /next            dispatch the next pending todo item as a prompt");
+    println!("  /continue        dispatch every unblocked pending todo");
+    println!("  /quit, /exit     leave the REPL");
+    println!("  <anything else>  submit as a prompt");
+}
+
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(n).collect();
+    format!("{head}…")
+}
+
+/// Sorted signature tuple per finding — used to detect merge
+/// quiescence (§16). Matches
+///id, status, summary, reproducer_sketch,
+/// plus the LENGTHS of relevant_symbols and relevant_file_sections so
+/// that added evidence registers as a change but order-only edits
+/// don't.
+pub(crate) fn findings_signature(
+    findings: &[kres_core::Finding],
+) -> Vec<(String, String, String, String, usize, usize)> {
+    let mut out: Vec<_> = findings
+        .iter()
+        .map(|f| {
+            (
+                f.id.clone(),
+                match f.status {
+                    kres_core::findings::Status::Active => "active".to_string(),
+                    kres_core::findings::Status::Invalidated => "invalidated".to_string(),
+                },
+                f.summary.clone(),
+                f.reproducer_sketch.clone(),
+                f.relevant_symbols.len(),
+                f.relevant_file_sections.len(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// §44: expand every `/load <path>` occurrence in `text` with the
+/// contents of `<path>`, wrapped in
+/// `\n--- <path> ---\n<content>\n--- end <path> ---\n`. Matches
+///On read failure the `/load …` literal survives
+/// in the prompt and the error prints to stderr.
+pub fn expand_inline_load(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let marker = b"/load ";
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(marker) {
+            // Scan to next whitespace for the path token.
+            let start = i + marker.len();
+            let mut end = start;
+            while end < bytes.len() && !(bytes[end] as char).is_whitespace() {
+                end += 1;
+            }
+            let path = &text[start..end];
+            if !path.is_empty() {
+                match std::fs::read_to_string(path) {
+                    Ok(body) => {
+                        out.push('\n');
+                        out.push_str(&format!("--- {path} ---\n"));
+                        out.push_str(&body);
+                        if !body.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        out.push_str(&format!("--- end {path} ---\n"));
+                        i = end;
+                        continue;
+                    }
+                    Err(e) => {
+                        kres_core::async_eprintln!("/load {path}: {e}");
+                        // Fall through: leave the `/load PATH`
+                        // literal in place so the operator can see
+                        // what didn't expand.
+                    }
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Human token counts: `12345` → `12.3k`. Matches
+/// helper at.
+fn fmt_k(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    if n < 1_000_000 {
+        return format!("{:.1}k", n as f64 / 1_000.0);
+    }
+    format!("{:.2}M", n as f64 / 1_000_000.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn session_without_orchestrator_drops_prompt() {
+        let mgr = TaskManager::new();
+        let s = Session::new(mgr, ReplConfig::default());
+        // We can't easily exercise submit_prompt from a unit test
+        // without stdin plumbing, but we can assert construction
+        // leaves `orchestrator` unset.
+        assert!(s.orchestrator.is_none());
+    }
+
+    #[test]
+    fn truncate_preserves_short() {
+        assert_eq!(truncate("abc", 5), "abc");
+    }
+
+    #[test]
+    fn truncate_ellipsises_long() {
+        assert_eq!(truncate("abcdef", 3), "abc…");
+    }
+}

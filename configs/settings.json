@@ -1,0 +1,8 @@
+{
+  "models": {
+    "fast": "@MODEL@",
+    "slow": "@SLOW_MODEL@",
+    "main": "@MODEL@",
+    "todo": "@MODEL@"
+  }
+}
