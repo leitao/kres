@@ -479,6 +479,7 @@ impl Orchestrator {
             .with_max_tokens(self.slow_max_tokens)
             .with_stream_label(match ctx.mode {
                 kres_core::TaskMode::Analysis => "slow",
+                kres_core::TaskMode::Generic => "slow (generic)",
                 kres_core::TaskMode::Coding => "slow (coding)",
             });
         // Coding-mode tasks want a different system prompt: one that
@@ -486,7 +487,10 @@ impl Orchestrator {
         // findings. Fall back to slow_system if the coding prompt
         // wasn't loaded (fresh install pre-setup.sh), noisily — the
         // analysis prompt will still produce something, just not a
-        // useful code artifact.
+        // useful code artifact.  Analysis and Generic share
+        // slow_system; the difference between them is handled at the
+        // dispatch level (lens fan-out vs single call), not in the
+        // per-call system prompt.
         let slow_system_for_call = match ctx.mode {
             kres_core::TaskMode::Coding => {
                 if self.slow_coding_system.is_some() {
@@ -498,7 +502,9 @@ impl Orchestrator {
                     self.slow_system.as_ref()
                 }
             }
-            kres_core::TaskMode::Analysis => self.slow_system.as_ref(),
+            kres_core::TaskMode::Analysis | kres_core::TaskMode::Generic => {
+                self.slow_system.as_ref()
+            }
         };
         if let Some(s) = slow_system_for_call {
             cfg = cfg.with_system(s.clone());
@@ -586,9 +592,12 @@ impl Orchestrator {
         // and drop any findings the model tried to emit anyway — a
         // coding task is not supposed to participate in the findings
         // pipeline (the reaper will skip merge/consolidator on this
-        // mode). Analysis tasks keep the historical shape.
+        // mode). Analysis and Generic tasks keep the historical
+        // shape (findings go through the merger).
         let (findings_out, code_output) = match ctx.mode {
-            kres_core::TaskMode::Analysis => (slow_parsed.findings, Vec::new()),
+            kres_core::TaskMode::Analysis | kres_core::TaskMode::Generic => {
+                (slow_parsed.findings, Vec::new())
+            }
             kres_core::TaskMode::Coding => (Vec::new(), slow_parsed.code_output),
         };
         Ok(TaskSummary {

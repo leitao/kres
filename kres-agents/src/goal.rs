@@ -94,16 +94,27 @@ pub async fn define_goal(gc: &GoalClient, prompt: &str) -> Option<GoalDefinition
                          for this query to be considered complete? Be \
                          concrete: name specific things that must be \
                          found, verified, written, or answered. The \
-                         `mode` field selects the pipeline: \"analysis\" \
-                         (read code, surface bugs/invariants/notes) or \
-                         \"coding\" (write code — reproducer, PoC, \
-                         selftest, trigger program, harness). Choose \
-                         \"coding\" only when the operator's REQUESTED \
-                         OUTPUT is source code they will run. Default \
-                         to \"analysis\" when the prompt is ambiguous. \
+                         `mode` field selects the pipeline:\n\
+                         - \"analysis\" — the REVIEW flow: multi-angle \
+                           audit, lens fan-out, consolidator + merger. \
+                           Pick when the operator asked to \"review\", \
+                           \"audit\", or \"find bugs in\" a target.\n\
+                         - \"generic\" — one slow-agent call per task \
+                           over the fast/main/slow/goal loop, with \
+                           findings merger but NO lens fan-out. Pick \
+                           for free-form questions (\"explain\", \"what \
+                           does X do\", \"trace path from A to B\", \
+                           narrow investigative prompts).\n\
+                         - \"coding\" — write source code (reproducer, \
+                           PoC, selftest, trigger, harness). Pick only \
+                           when the REQUESTED OUTPUT is code the \
+                           operator will run.\n\
+                         Default to \"generic\" when the prompt is \
+                         ambiguous — it's the cheapest analytical \
+                         path.\n\
                          Return JSON only:\n\
                          {\"goal\": \"specific completion criteria\", \
-                          \"mode\": \"analysis\" | \"coding\"}"
+                          \"mode\": \"analysis\" | \"generic\" | \"coding\"}"
     });
     let body = serde_json::to_string_pretty(&request).ok()?;
     let mut cfg = CallConfig::defaults_for(gc.model.clone())

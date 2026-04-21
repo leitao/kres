@@ -1,8 +1,18 @@
 //! Per-task pipeline mode.
 //!
-//! `Analysis` is the historical default: the fast+main loop gathers,
-//! the slow agent fans out across lenses, and the consolidator +
-//! merger fold each lens's findings into the cumulative list.
+//! Three flows:
+//!
+//! `Analysis` — the review flow.  The fast+main loop gathers context,
+//! the slow agent fans out across session-wide lenses (from the
+//! review-template), and the consolidator + cross-task merger fold
+//! per-lens findings into the cumulative list.  Degrades to a single
+//! slow call when no lenses are configured.
+//!
+//! `Generic` — just the main/fast/slow/goal loop, no lens fan-out.
+//! One slow call per task, findings still merge into the cumulative
+//! list.  Good for free-form questions ("explain X", "what does this
+//! do", "trace the call path from Y to Z") where the review-template
+//! multi-angle spread would be overkill.
 //!
 //! `Coding` swaps the slow-agent system prompt for one that writes
 //! source code (reproducers, PoCs, selftests). The pipeline skips the
@@ -17,6 +27,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum TaskMode {
     Analysis,
+    Generic,
     Coding,
 }
 
@@ -43,7 +54,15 @@ impl TaskMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Analysis => "analysis",
+            Self::Generic => "generic",
             Self::Coding => "coding",
         }
+    }
+
+    /// True for modes that feed the findings pipeline (findings merger
+    /// runs, /summary bug-report is meaningful). Coding tasks produce
+    /// files instead of findings, so they return false.
+    pub fn produces_findings(self) -> bool {
+        matches!(self, Self::Analysis | Self::Generic)
     }
 }

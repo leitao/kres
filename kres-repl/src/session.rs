@@ -655,7 +655,11 @@ impl Session {
                         .await;
                     }
                     let pre_size = mgr_for_reaper.findings_snapshot().await.len();
-                    let had_delta = matches!(r.mode, kres_core::TaskMode::Analysis)
+                    // Findings merger runs for both Analysis (review)
+                    // and Generic tasks — both feed the findings
+                    // pipeline. Coding tasks skip it: their output is
+                    // source files, not findings.
+                    let had_delta = r.mode.produces_findings()
                         && !r.findings_delta.is_empty();
                     if had_delta {
                         // §16: when a consolidator client is available
@@ -1443,12 +1447,24 @@ impl Session {
                     original_prompt,
                     mode: task_mode,
                 };
-                // Coding-mode tasks always run through run_once_with_ctx
-                // with the coding system prompt — lenses / consolidator
-                // are analysis-only concepts. Analysis tasks pick the
-                // lens-fanout path when lenses are installed.
+                // Dispatch by mode:
+                //   Coding  → single slow call with slow_coding_system;
+                //             reaper persists code_output, skips merge.
+                //   Analysis → REVIEW flow. Lens fan-out + consolidator
+                //             when lenses are installed; otherwise
+                //             degrades to a single call (the old no-
+                //             lens analysis path).
+                //   Generic → one-shot main/fast/slow/goal loop. Single
+                //             slow call with slow_system, findings
+                //             merger still runs in the reaper. Lens
+                //             fan-out is bypassed even when the session
+                //             has lenses installed — the classifier
+                //             picked Generic precisely because the
+                //             multi-angle spread would be overkill for
+                //             this prompt.
                 let res = match task_mode {
-                    kres_agents::TaskMode::Coding => {
+                    kres_agents::TaskMode::Coding
+                    | kres_agents::TaskMode::Generic => {
                         orc_task
                             .run_once_with_ctx(&text, &ctx, &handle.shutdown)
                             .await
