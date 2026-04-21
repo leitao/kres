@@ -1273,6 +1273,7 @@ impl Session {
                 Command::Tasks => self.print_tasks().await,
                 Command::Stop => self.cmd_stop().await,
                 Command::Clear => self.cmd_clear().await,
+                Command::Compact => self.cmd_compact().await,
                 Command::Findings => self.print_findings().await,
                 Command::Cost => self.print_cost(),
                 Command::Todo { clear } => {
@@ -1502,6 +1503,22 @@ impl Session {
         let consolidator = self.consolidator.clone();
         let original_prompt = text.clone();
         let prompt_for_park = text.clone();
+        // Build the prompt that actually reaches the fast agent:
+        // the raw operator text, optionally prefixed with a short
+        // reminder of what prior tasks in this session did. That
+        // way a second submit (e.g. "now verify it runs clean")
+        // doesn't arrive with zero context and force the agents to
+        // rediscover what they just wrote. /clear wipes the ledger;
+        // /compact shrinks it to a single summary entry.
+        let context_preamble = build_recent_context_preamble(
+            &self.accumulated.lock().await,
+            RECENT_CONTEXT_CAP_CHARS,
+        );
+        let text = if context_preamble.is_empty() {
+            text
+        } else {
+            format!("{context_preamble}\n\n---\n\n{text}")
+        };
         let task_id = self
             .mgr
             .spawn(task_brief, None, move |handle| async move {
@@ -2243,11 +2260,186 @@ impl Session {
         let out = self.mgr.stop_all(self.cfg.stop_grace).await;
         self.mgr.replace_findings(vec![]).await;
         self.mgr.replace_todo(vec![]).await;
+        // Also wipe the accumulated-analysis ledger so the next
+        // prompt starts with a clean slate. Without this, the
+        // "recent context" preamble submit_prompt injects would
+        // keep referencing work the operator just said to forget.
+        self.accumulated.lock().await.clear();
+        *self.last_analysis.lock().await = None;
+        self.deferred.lock().await.clear();
         println!(
-            "/clear: stopped {} task(s), reset findings + todo",
+            "/clear: stopped {} task(s), reset findings + todo + accumulated context",
             out.stopped + out.grace_expired
         );
     }
+
+    /// `/compact` — run a single fast-agent call that compresses the
+    /// accumulated-analysis ledger into one short summary entry.
+    /// Subsequent prompts still see continuity ("we did X earlier")
+    /// but with a fraction of the tokens. Non-fatal: on failure we
+    /// leave the ledger untouched.
+    async fn cmd_compact(&self) {
+        let entries = self.accumulated.lock().await.clone();
+        if entries.len() <= 1 {
+            println!("/compact: nothing to compact (ledger has {} entry)", entries.len());
+            return;
+        }
+        let Some(orc) = self.orchestrator.as_ref() else {
+            println!("/compact: no orchestrator configured");
+            return;
+        };
+        // Build the inference request: feed every accumulated entry
+        // to the fast agent and ask for a terse single-paragraph
+        // summary. Reuse the fast client the orchestrator already
+        // holds — cheapest call in the pipeline.
+        let mut joined = String::new();
+        for (i, e) in entries.iter().enumerate() {
+            if i > 0 {
+                joined.push_str("\n\n---\n\n");
+            }
+            joined.push_str(&format!("## {}\n\n{}", e.task, e.analysis));
+        }
+        let request = serde_json::json!({
+            "task": "compact_accumulated",
+            "ledger": joined,
+            "instructions": "Compress the preceding task-by-task analysis ledger into a single TERSE summary — 2 to 6 sentences total — that preserves: (a) what code was examined, (b) what files were written, if any, (c) key findings or decisions, (d) open questions still worth pulling on. Omit per-task boilerplate and restated code. Return JSON only: {\"summary\": \"the compressed text\"}"
+        });
+        let body = match serde_json::to_string_pretty(&request) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("/compact: serialise failed: {e}");
+                return;
+            }
+        };
+        let mut cfg = kres_llm::config::CallConfig::defaults_for(orc.fast_model.clone())
+            .with_max_tokens(4_000)
+            .with_stream_label("compact");
+        if let Some(s) = &orc.fast_system {
+            cfg = cfg.with_system(s.clone());
+        }
+        if let Some(n) = orc.fast_max_input_tokens {
+            cfg = cfg.with_max_input_tokens(n);
+        }
+        let messages = vec![kres_llm::request::Message {
+            role: "user".into(),
+            content: body.clone(),
+            cache: false,
+            cached_prefix: None,
+        }];
+        if let Some(lg) = &self.logger {
+            lg.log_main("user", &body, None, None);
+        }
+        let resp = match orc.fast_client.messages_streaming(&cfg, &messages).await {
+            Ok(r) => r,
+            Err(e) => {
+                println!("/compact: fast-agent call failed: {e}; ledger unchanged");
+                return;
+            }
+        };
+        let text = {
+            let mut out = String::new();
+            for block in &resp.content {
+                if let kres_llm::request::ContentBlock::Text { text } = block {
+                    out.push_str(text);
+                }
+            }
+            out
+        };
+        if let Some(lg) = &self.logger {
+            lg.log_main(
+                "assistant",
+                &text,
+                Some(kres_core::LoggedUsage {
+                    input: resp.usage.input_tokens,
+                    output: resp.usage.output_tokens,
+                    cache_creation: resp.usage.cache_creation_input_tokens,
+                    cache_read: resp.usage.cache_read_input_tokens,
+                }),
+                None,
+            );
+        }
+        // The fast agent is expected to reply with
+        // {"summary": "..."}. Tolerate prose-wrapped JSON.
+        let summary: Option<String> = (|| {
+            #[derive(serde::Deserialize)]
+            struct CompactResp {
+                #[serde(default)]
+                summary: String,
+            }
+            if let Ok(r) = serde_json::from_str::<CompactResp>(text.trim()) {
+                return (!r.summary.is_empty()).then_some(r.summary);
+            }
+            // Brace-match fallback.
+            let (start, end) = (text.find('{'), text.rfind('}'));
+            if let (Some(s), Some(e)) = (start, end) {
+                if let Ok(r) = serde_json::from_str::<CompactResp>(&text[s..=e]) {
+                    return (!r.summary.is_empty()).then_some(r.summary);
+                }
+            }
+            None
+        })();
+        let summary = match summary {
+            Some(s) => s,
+            None => {
+                println!(
+                    "/compact: could not parse a summary from the fast agent; ledger unchanged"
+                );
+                return;
+            }
+        };
+        let before = entries.len();
+        let replaced = AccumulatedEntry {
+            task: format!("compacted ({} prior task(s))", before),
+            analysis: summary.clone(),
+        };
+        let mut guard = self.accumulated.lock().await;
+        *guard = vec![replaced];
+        println!(
+            "/compact: replaced {before} entry(s) with a {}-char summary",
+            summary.len()
+        );
+    }
+}
+
+/// Max total size of the "recent context" preamble
+/// `submit_prompt` injects ahead of a new operator prompt. The
+/// accumulated ledger can grow without bound across a long session;
+/// capping here keeps the attached-context cost bounded. Use
+/// /compact to trim the ledger itself; this cap only limits what
+/// leaks into each new task's prompt.
+const RECENT_CONTEXT_CAP_CHARS: usize = 8_000;
+
+/// Render the most recent accumulated-analysis entries into a
+/// short preamble, newest-first, capped at `cap` characters.
+/// Returns an empty string when the ledger is empty.
+fn build_recent_context_preamble(entries: &[AccumulatedEntry], cap: usize) -> String {
+    if entries.is_empty() || cap == 0 {
+        return String::new();
+    }
+    let mut out = String::from("Recent context from this session (most recent first):\n\n");
+    for e in entries.iter().rev() {
+        if out.len() >= cap {
+            break;
+        }
+        let remaining = cap.saturating_sub(out.len());
+        // Budget each entry: at most half the remaining cap, so an
+        // early giant entry can't starve the rest. Cap at 2k chars
+        // per entry regardless.
+        let entry_budget = (remaining / 2).max(400).min(2_000);
+        let head: String = e.analysis.chars().take(entry_budget).collect();
+        out.push_str(&format!("### {}\n{}", e.task, head));
+        if e.analysis.chars().count() > entry_budget {
+            out.push_str("\n… (entry truncated)\n");
+        } else if !head.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    if out.len() > cap {
+        out.truncate(cap);
+        out.push_str("\n… (preamble truncated at cap)\n");
+    }
+    out
 }
 
 /// Compile-time fallback for the coding-mode slow-agent system prompt.
@@ -2687,7 +2879,8 @@ fn print_help() {
     println!("  /tasks, /task    list running tasks");
     println!("  /findings        summarise findings");
     println!("  /stop            cancel running tasks");
-    println!("  /clear           stop tasks and reset findings + todo");
+    println!("  /clear           stop tasks, reset findings + todo + accumulated context");
+    println!("  /compact         summarise accumulated context into one short entry");
     println!("  /cost            show API token usage");
     println!("  /todo            show the todo list");
     println!("  /report <path>   write findings report (markdown)");

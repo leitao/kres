@@ -11,8 +11,17 @@ pub enum Command {
     Findings,
     /// `/stop` — cancel every running task.
     Stop,
-    /// `/clear` — cancel tasks AND reset the in-memory findings list.
+    /// `/clear` — cancel tasks AND reset the in-memory findings +
+    /// todo + accumulated-analysis state. After /clear the next
+    /// prompt starts with no conversational context carried
+    /// forward.
     Clear,
+    /// `/compact` — replace the accumulated-analysis ledger with a
+    /// short fast-agent-produced summary. Keeps conversational
+    /// continuity (subsequent prompts still see a brief of what was
+    /// done) while dropping the bulk that was bloating the
+    /// preamble attached to every new prompt.
+    Compact,
     /// `/cost` — print accumulated token usage.
     Cost,
     /// `/todo [--clear]` — show or clear the current todo list.
@@ -75,6 +84,7 @@ pub fn parse_command(line: &str) -> Command {
             "findings" => Command::Findings,
             "stop" => Command::Stop,
             "clear" => Command::Clear,
+            "compact" => Command::Compact,
             "cost" => Command::Cost,
             "todo" => Command::Todo {
                 clear: rest.split_whitespace().any(|tok| tok == "--clear"),
@@ -162,6 +172,11 @@ mod tests {
     #[test]
     fn parses_clear() {
         assert_eq!(parse_command("/clear"), Command::Clear);
+    }
+
+    #[test]
+    fn parses_compact() {
+        assert_eq!(parse_command("/compact"), Command::Compact);
     }
 
     #[test]
