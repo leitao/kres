@@ -1416,7 +1416,27 @@ impl Session {
         Ok(())
     }
 
+    /// Operator-typed submission (REPL line, `--prompt`, /load,
+    /// /edit, /reply, /continue's stashed-interrupted resume).
+    /// Prepends the accumulated-analysis ledger as "Recent context"
+    /// so a follow-up operator prompt doesn't start cold.
     async fn submit_prompt(&self, text: String) {
+        self.submit_prompt_inner(text, true).await
+    }
+
+    /// Pipeline-driven submission (cmd_next / cmd_continue's
+    /// batch-dispatch loop — auto-continue also funnels through
+    /// here). The todo item already carries a structured brief and
+    /// the slow agent still sees previous_findings + original_prompt
+    /// via RunContext, so re-injecting the ledger as a preamble
+    /// would double-count (see review of 04ea466): it would widen
+    /// narrow fetch tasks, bust the fast-agent's cached prefix, and
+    /// pay 8k chars per turn on every follow-up.
+    async fn submit_from_pipeline(&self, text: String) {
+        self.submit_prompt_inner(text, false).await
+    }
+
+    async fn submit_prompt_inner(&self, text: String, include_recent_context: bool) {
         let Some(orc) = self.orchestrator.clone() else {
             println!("(no orchestrator configured — prompt dropped)");
             println!("hint: rerun `kres repl` with agent configs to enable prompt handling");
@@ -1504,20 +1524,27 @@ impl Session {
         let original_prompt = text.clone();
         let prompt_for_park = text.clone();
         // Build the prompt that actually reaches the fast agent:
-        // the raw operator text, optionally prefixed with a short
-        // reminder of what prior tasks in this session did. That
-        // way a second submit (e.g. "now verify it runs clean")
-        // doesn't arrive with zero context and force the agents to
-        // rediscover what they just wrote. /clear wipes the ledger;
-        // /compact shrinks it to a single summary entry.
-        let context_preamble = build_recent_context_preamble(
-            &self.accumulated.lock().await,
-            RECENT_CONTEXT_CAP_CHARS,
-        );
-        let text = if context_preamble.is_empty() {
-            text
+        // for operator-typed submissions (`include_recent_context =
+        // true`) we prepend the accumulated-analysis ledger so a
+        // follow-up prompt like "now verify it runs clean" doesn't
+        // arrive cold. Pipeline-driven submits (cmd_next,
+        // cmd_continue's batch loop) skip the preamble because the
+        // todo item already carries a focused brief and the slow
+        // agent receives previous_findings + original_prompt via
+        // RunContext anyway.  /clear wipes the ledger; /compact
+        // shrinks it to a single summary entry.
+        let text = if include_recent_context {
+            let context_preamble = build_recent_context_preamble(
+                &self.accumulated.lock().await,
+                RECENT_CONTEXT_CAP_CHARS,
+            );
+            if context_preamble.is_empty() {
+                text
+            } else {
+                format!("{context_preamble}\n\n---\n\n{text}")
+            }
         } else {
-            format!("{context_preamble}\n\n---\n\n{text}")
+            text
         };
         let task_id = self
             .mgr
@@ -1770,7 +1797,7 @@ impl Session {
             self.mgr
                 .mark_todo_status(&item.name, TodoStatus::InProgress)
                 .await;
-            self.submit_prompt(prompt).await;
+            self.submit_from_pipeline(prompt).await;
             dispatched += 1;
         }
         let mut msg = format!("/continue: dispatched {dispatched} item(s)");
@@ -1823,7 +1850,7 @@ impl Session {
             .mark_todo_status(&item.name, TodoStatus::InProgress)
             .await;
         println!("/next: dispatching {}", truncate(&item.name, 80));
-        self.submit_prompt(prompt).await;
+        self.submit_from_pipeline(prompt).await;
     }
 
     async fn cmd_edit(&self) {
