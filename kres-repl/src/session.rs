@@ -1470,12 +1470,27 @@ impl Session {
                 );
                 if !added.is_empty() {
                     let label: Vec<String> =
-                        added.iter().map(|p| p.display().to_string()).collect();
+                        added.iter().map(|g| g.dir.display().to_string()).collect();
                     kres_core::async_eprintln!(
                         "consent: granted read access to {} dir(s) named in the prompt: {}",
                         added.len(),
                         truncate(&label.join(", "), 200)
                     );
+                    // Louder warning when the operator's prompt
+                    // grants a top-level system tree (/usr, /etc,
+                    // $HOME, …) — usually accidental, e.g. pasting
+                    // a stack trace with a libc path.
+                    let wide: Vec<String> = added
+                        .iter()
+                        .filter(|g| g.suspicious)
+                        .map(|g| g.dir.display().to_string())
+                        .collect();
+                    if !wide.is_empty() {
+                        kres_core::async_eprintln!(
+                            "consent: WARNING wide grant(s) for top-level system dir(s): {} — narrow the path in the prompt or restart kres if accidental",
+                            wide.join(", ")
+                        );
+                    }
                 }
             }
         }
@@ -2327,9 +2342,18 @@ impl Session {
         self.accumulated.lock().await.clear();
         *self.last_analysis.lock().await = None;
         self.deferred.lock().await.clear();
+        // Drop every outside-workspace read consent. The store is
+        // global (OnceLock); without this a /clear would leave
+        // grants from the prior topic in place and a follow-up
+        // prompt on a different topic could quietly read paths the
+        // operator forgot they'd allowed.
+        let dropped_grants = kres_core::consent::get()
+            .map(|s| s.clear())
+            .unwrap_or(0);
         println!(
-            "/clear: stopped {} task(s), reset findings + todo + accumulated context",
-            out.stopped + out.grace_expired
+            "/clear: stopped {} task(s), reset findings + todo + accumulated context, dropped {} consent grant(s)",
+            out.stopped + out.grace_expired,
+            dropped_grants
         );
     }
 

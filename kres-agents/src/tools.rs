@@ -492,10 +492,21 @@ fn resolve_workspace(workspace: &Path, rel: &str) -> Result<PathBuf, AgentError>
             // normalising lexically. Consent only bypasses the
             // workspace gate; a missing file is still a missing
             // file.
+            //
+            // For the consent check we also try to canonicalise as
+            // far up as possible. The grants in the store are
+            // stored in canonical form (consent.rs:73), so a
+            // lex-only path can fail starts_with against a grant
+            // whose parent is a symlink (macOS /tmp →
+            // /private/tmp; Linux /var/run → /run on many distros).
+            // canonical_walk_up resolves the longest existing
+            // ancestor and re-joins the missing tail; that result
+            // still starts_with the canonical grant.
             let normalised = normalise_lexical(&joined);
+            let consent_probe = canonical_walk_up(&normalised);
             if normalised.starts_with(&ws_canon)
                 || normalised.starts_with(workspace)
-                || consent_allows(&normalised)
+                || consent_allows(&consent_probe)
             {
                 Ok(normalised)
             } else {
@@ -505,6 +516,35 @@ fn resolve_workspace(workspace: &Path, rel: &str) -> Result<PathBuf, AgentError>
                     ws_canon.display()
                 )))
             }
+        }
+    }
+}
+
+/// Walk up the path until we find an ancestor that canonicalises,
+/// then re-join the tail underneath the canonical ancestor. Returns
+/// the original path verbatim when even the root won't canonicalise
+/// (vanishingly rare). Used by resolve_workspace's lex-fallback so
+/// the consent check can work against canonical grants even when
+/// the leaf doesn't exist yet.
+fn canonical_walk_up(p: &Path) -> PathBuf {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(c) = cur.canonicalize() {
+            // Re-attach the tail components in the order they were
+            // peeled off (reverse them — push order was leaf-first).
+            let mut out = c;
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return out;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                cur = parent;
+            }
+            _ => return p.to_path_buf(),
         }
     }
 }
@@ -736,6 +776,68 @@ mod tests {
                 _ => panic!("wrong err for {cmd}"),
             }
         }
+    }
+
+    /// Helper: ensure a ConsentStore is installed and return a
+    /// handle to it. install() can only succeed once per process,
+    /// so a follow-on test that tries to install again gets back
+    /// whatever was installed first. Because each test grants its
+    /// own unique tmpdir, sharing the store is safe — no cross-test
+    /// interference.
+    fn ensure_global_consent_store() -> std::sync::Arc<kres_core::ConsentStore> {
+        let s = std::sync::Arc::new(kres_core::ConsentStore::new());
+        let _ = kres_core::consent::install(s.clone());
+        kres_core::consent::get().expect("store installed")
+    }
+
+    #[test]
+    fn read_outside_workspace_blocked_without_consent() {
+        let workspace = tmpdir("read-out-blocked-ws");
+        let outside_dir = tmpdir("read-out-blocked-other");
+        let outside_file = outside_dir.join("hello.txt");
+        std::fs::write(&outside_file, b"hi").unwrap();
+        // No consent granted for outside_dir.
+        let args = ReadArgs {
+            file: outside_file.to_string_lossy().to_string(),
+            line: None,
+            count: None,
+            end_line: None,
+        };
+        let res = read_file_range(&workspace, &args);
+        match res {
+            Err(AgentError::Other(m)) => {
+                assert!(m.contains("escapes workspace"), "got {m}");
+                assert!(m.contains("mention the containing directory"), "got {m}");
+            }
+            other => panic!("expected escape rejection, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&workspace).ok();
+        std::fs::remove_dir_all(&outside_dir).ok();
+    }
+
+    #[test]
+    fn read_outside_workspace_allowed_after_consent_grant() {
+        let workspace = tmpdir("read-out-allowed-ws");
+        let outside_dir = tmpdir("read-out-allowed-other");
+        let outside_file = outside_dir.join("hi.txt");
+        std::fs::write(&outside_file, b"contents").unwrap();
+        let store = ensure_global_consent_store();
+        let granted = store.grant_from_mention(&outside_dir).unwrap();
+        let args = ReadArgs {
+            file: outside_file.to_string_lossy().to_string(),
+            line: None,
+            count: None,
+            end_line: None,
+        };
+        let got = read_file_range(&workspace, &args)
+            .expect("read should succeed via consent grant");
+        assert_eq!(got, "contents");
+        // Cleanup: revert the grant so a follow-on test starts
+        // clean. Removing just our entry is enough — `clear()`
+        // would also wipe other in-flight tests' grants.
+        let _ = granted; // keep around for debug asserts
+        std::fs::remove_dir_all(&workspace).ok();
+        std::fs::remove_dir_all(&outside_dir).ok();
     }
 
     #[tokio::test]

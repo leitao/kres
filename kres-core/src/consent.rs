@@ -64,6 +64,15 @@ impl ConsentStore {
     pub fn list(&self) -> Vec<PathBuf> {
         self.granted.read().unwrap().iter().cloned().collect()
     }
+
+    /// Drop every grant. Used by `/clear` so a "start over" really
+    /// starts over — including outside-workspace consents.
+    pub fn clear(&self) -> usize {
+        let mut g = self.granted.write().unwrap();
+        let n = g.len();
+        g.clear();
+        n
+    }
 }
 
 impl Default for ConsentStore {
@@ -86,9 +95,23 @@ pub fn get() -> Option<Arc<ConsentStore>> {
     GLOBAL.get().cloned()
 }
 
+/// One newly-granted directory plus a suspicion flag the caller
+/// uses to print a louder warning when the grant covers a
+/// top-level system tree (`/usr`, `/etc`, `/var`, `/opt`, the
+/// operator's `$HOME`, …). Operators paste stack traces and
+/// library paths into prompts; a single mention of
+/// `/usr/lib/x86_64-linux-gnu/libc.so.6` would otherwise quietly
+/// grant the parent dir without flagging it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantedPath {
+    pub dir: PathBuf,
+    pub suspicious: bool,
+}
+
 /// Scan a block of operator text for path-like tokens and grant
 /// each one that resolves to an existing file or directory. Returns
-/// the directories that were newly granted (deduped). The `cwd` is
+/// the directories that were newly granted (deduped) wrapped in
+/// `GrantedPath` so the caller can flag wide grants. The `cwd` is
 /// used as the base for relative paths; absolute paths are used
 /// verbatim.
 ///
@@ -97,9 +120,10 @@ pub fn get() -> Option<Arc<ConsentStore>> {
 /// real filesystem entry when joined with cwd. Tokens are stripped
 /// of common trailing punctuation (`,`, `.`, `:`, `;`, `!`, `?`,
 /// backticks, parens, brackets, braces, quotes) before resolution —
-/// operator prose tends to punctuate paths.
-pub fn grant_paths_from_text(store: &ConsentStore, cwd: &Path, text: &str) -> Vec<PathBuf> {
-    let mut added: Vec<PathBuf> = Vec::new();
+/// operator prose tends to punctuate paths. URL-scheme tokens
+/// (`http://…`) are skipped at the textual layer.
+pub fn grant_paths_from_text(store: &ConsentStore, cwd: &Path, text: &str) -> Vec<GrantedPath> {
+    let mut added: Vec<GrantedPath> = Vec::new();
     for raw in text.split_whitespace() {
         let candidate = strip_token_punctuation(raw);
         if candidate.is_empty() {
@@ -113,12 +137,50 @@ pub fn grant_paths_from_text(store: &ConsentStore, cwd: &Path, text: &str) -> Ve
             continue;
         };
         if let Some(dir) = store.grant_from_mention(&p) {
-            if !added.contains(&dir) {
-                added.push(dir);
+            let suspicious = is_suspicious_grant(&dir);
+            if !added.iter().any(|g| g.dir == dir) {
+                added.push(GrantedPath { dir, suspicious });
             }
         }
     }
     added
+}
+
+/// Heuristic: is this grant unusually wide? `/usr`, `/etc`, `/var`,
+/// `/opt`, `/lib*`, or the operator's own `$HOME` would be flagged.
+/// A grant under those (e.g. `/usr/local/myproj`) is fine — only
+/// the bare top-level dir trips this.
+fn is_suspicious_grant(dir: &Path) -> bool {
+    // Bare-tree exact matches.
+    let suspicious_exact: &[&str] = &[
+        "/usr",
+        "/etc",
+        "/var",
+        "/opt",
+        "/lib",
+        "/lib64",
+        "/bin",
+        "/sbin",
+        "/boot",
+        "/srv",
+        "/sys",
+        "/proc",
+        "/root",
+        "/home",
+    ];
+    if let Some(s) = dir.to_str() {
+        if suspicious_exact.contains(&s) {
+            return true;
+        }
+    }
+    // The operator's exact $HOME is also wide — covers the entire
+    // user account.
+    if let Some(home) = dirs::home_dir() {
+        if dir == home {
+            return true;
+        }
+    }
+    false
 }
 
 fn strip_token_punctuation(s: &str) -> &str {
@@ -149,6 +211,23 @@ fn strip_token_punctuation(s: &str) -> &str {
 fn looks_like_path(s: &str) -> bool {
     if s.is_empty() {
         return false;
+    }
+    // Skip URL-scheme tokens — `https://github.com/x`, `s3://bucket/key`,
+    // `git+ssh://host/repo`. They contain `/` and would otherwise
+    // burn a stat() syscall in resolve_candidate. Scheme syntax
+    // (RFC 3986): first char ascii-alpha, rest ascii-alphanumeric
+    // or `+`, `-`, `.`.
+    if let Some(i) = s.find("://") {
+        let scheme = &s[..i];
+        let mut chars = scheme.chars();
+        let first_ok = chars
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false);
+        let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if first_ok && rest_ok {
+            return false;
+        }
     }
     s.starts_with('/')
         || s.starts_with("./")
@@ -233,7 +312,9 @@ mod tests {
         let msg = format!("please read {} carefully.", d.display());
         let added = grant_paths_from_text(&s, Path::new("/tmp"), &msg);
         let canon = d.canonicalize().unwrap();
-        assert!(added.contains(&canon));
+        assert!(added.iter().any(|g| g.dir == canon), "added={added:?}");
+        // tmpdir-based grant should not trip the suspicion flag.
+        assert!(added.iter().all(|g| !g.suspicious));
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -246,7 +327,7 @@ mod tests {
         let msg = format!("check `{}`, thanks.", d.display());
         let added = grant_paths_from_text(&s, Path::new("/tmp"), &msg);
         let canon = d.canonicalize().unwrap();
-        assert!(added.contains(&canon), "added={added:?}");
+        assert!(added.iter().any(|g| g.dir == canon), "added={added:?}");
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -258,6 +339,23 @@ mod tests {
     }
 
     #[test]
+    fn is_suspicious_grant_flags_top_level_system_dirs() {
+        for d in ["/usr", "/etc", "/var", "/opt", "/bin", "/lib", "/home"] {
+            assert!(is_suspicious_grant(Path::new(d)), "{d} should be flagged");
+        }
+    }
+
+    #[test]
+    fn is_suspicious_grant_does_not_flag_sub_paths() {
+        for d in ["/usr/local/myproj", "/etc/myapp", "/var/log/specific"] {
+            assert!(
+                !is_suspicious_grant(Path::new(d)),
+                "{d} should NOT be flagged"
+            );
+        }
+    }
+
+    #[test]
     fn looks_like_path_filters_bare_identifiers() {
         assert!(!looks_like_path("hello"));
         assert!(!looks_like_path("hello.c"));
@@ -266,5 +364,17 @@ mod tests {
         assert!(looks_like_path("../foo"));
         assert!(looks_like_path("~/proj"));
         assert!(looks_like_path("fs/btrfs/ctree.c"));
+    }
+
+    #[test]
+    fn looks_like_path_skips_url_schemes() {
+        assert!(!looks_like_path("http://example.com/foo"));
+        assert!(!looks_like_path("https://github.com/masoncl/review-prompts"));
+        assert!(!looks_like_path("s3://bucket/key"));
+        assert!(!looks_like_path("ftp://host/p"));
+        // But a path with a colon in a non-scheme position still
+        // matches (e.g. "fs/btrfs/ctree.c:123" is a citation form
+        // we want to grant the file's parent for).
+        assert!(looks_like_path("fs/btrfs/ctree.c:123"));
     }
 }
