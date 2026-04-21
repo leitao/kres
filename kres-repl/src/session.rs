@@ -23,6 +23,19 @@ pub struct ReplConfig {
     /// Stop the REPL after N completed task runs (0 = unlimited).
     /// Matches semantics.
     pub turns_limit: u32,
+    /// When `turns_limit == 0`:
+    ///   * `false` (default): trust the goal agent — keep running
+    ///     until the goal-met handler drains the todo list, so the
+    ///     session stops only when the goal agent says it is done.
+    ///     When no goal agent is configured, fall back to stopping
+    ///     as soon as the active batch finishes (pending followups
+    ///     go to /followup).
+    ///   * `true`: also accept 3 consecutive analysis-producing runs
+    ///     with no new findings as a stop condition — a cost cap
+    ///     for when the goal agent stays stubbornly "not met".
+    /// No effect when `turns_limit > 0`: the run-count cap still
+    /// wins there.
+    pub follow_followups: bool,
     /// Per-task append-target for the report markdown (§26). When
     /// set, every reaped task's analysis lands as a new `## [type]
     /// name` section with a timestamp. When None, nothing is
@@ -49,6 +62,7 @@ impl Default for ReplConfig {
             stop_grace: Duration::from_secs(5),
             findings_base: None,
             turns_limit: 0,
+            follow_followups: false,
             report_path: None,
             results_dir: None,
             template_path: None,
@@ -529,6 +543,7 @@ impl Session {
         let report_path_for_reaper = self.cfg.report_path.clone();
         let turns_exhausted_for_reaper = self.turns_exhausted.clone();
         let turns_limit = self.cfg.turns_limit;
+        let follow_followups = self.cfg.follow_followups;
         // §16: findings-signature watchdog. Every successful merge
         // increments `quiescent` when the merged list's signature
         // matches the prior one; five consecutive no-change merges
@@ -959,13 +974,24 @@ impl Session {
                         break;
                     }
                 } else {
-                    // --turns 0 (unlimited) — still stop naturally
-                    // when either (a) nothing is queued/running, so
-                    // the agents have drained the followup pipeline,
-                    // or (b) we've had NO_NEW_FINDINGS_STOP completed
-                    // runs in a row that added nothing new to the
-                    // findings list. Without this the REPL idles
-                    // forever waiting for input it will never get.
+                    // --turns 0 (unlimited) — stopping rule:
+                    //
+                    //   Default: trust the goal agent.  The goal-met
+                    //   branch upstream drains the todo list, so
+                    //   `followups_drained` becoming true is our
+                    //   signal that the goal agent declared
+                    //   completion.  We keep running as long as the
+                    //   goal agent keeps saying "not met" and
+                    //   follow-up tasks keep appearing.
+                    //
+                    //   --follow: also accept 3 consecutive
+                    //   analysis-producing runs with no new findings
+                    //   as a stop, so an operator can cap the cost
+                    //   even when the goal agent is stubborn.
+                    //
+                    //   No goal agent configured: fall back to
+                    //   "active batch finished" so the REPL doesn't
+                    //   loop forever in the no-goal-agent case.
                     let active = mgr_for_reaper.active_count().await;
                     let todo = mgr_for_reaper.todo_snapshot().await;
                     let pending_or_blocked = todo
@@ -980,9 +1006,27 @@ impl Session {
                         .count();
                     let followups_drained = active == 0 && pending_or_blocked == 0;
                     let no_progress = no_new_findings_streak >= NO_NEW_FINDINGS_STOP;
-                    if followups_drained || no_progress {
-                        let reason = if followups_drained {
-                            "followup list empty".to_string()
+                    let goal_configured = goal_client_for_reaper.is_some();
+                    let no_goal_batch_stop =
+                        !goal_configured && !follow_followups && active == 0;
+                    let should_stop = if follow_followups {
+                        followups_drained || no_progress
+                    } else if goal_configured {
+                        followups_drained
+                    } else {
+                        no_goal_batch_stop
+                    };
+                    if should_stop {
+                        let reason = if no_goal_batch_stop && !followups_drained {
+                            format!(
+                                "no goal agent; active batch finished ({pending_or_blocked} followup(s) deferred; pass --follow to chase them)"
+                            )
+                        } else if followups_drained {
+                            if goal_configured {
+                                "goal met (todo list drained)".to_string()
+                            } else {
+                                "followup list empty".to_string()
+                            }
                         } else {
                             format!(
                                 "no new findings for {no_new_findings_streak} consecutive run(s)"
@@ -1731,6 +1775,13 @@ impl Session {
             findings_path,
             output_path: output_path.clone(),
             template_path: self.cfg.template_path.clone(),
+            // The REPL's /summary path keeps the plain-text default;
+            // `--markdown` is a --summary-time flag, not a per-turn
+            // one.  An operator who wants markdown inside the REPL
+            // can point `/summary --template ~/.kres/prompts/bug-
+            // summary-markdown.md` at it, or use `kres --summary
+            // --markdown` post-hoc.
+            markdown: false,
             original_prompt,
             client: orc.fast_client.clone(),
             model: orc.fast_model.clone(),

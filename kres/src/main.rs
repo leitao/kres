@@ -87,6 +87,18 @@ struct ReplArgs {
     /// the default.
     #[arg(long, default_value_t = 0, value_name = "N")]
     turns: u32,
+    /// When `--turns 0` (unlimited), add a secondary stop on
+    /// stagnation: if 3 consecutive analysis-producing runs fail to
+    /// grow the findings list, exit even if the goal agent has not
+    /// declared completion. Without `--follow`, `--turns 0` trusts
+    /// the goal agent and keeps running until the goal is met (the
+    /// goal-met handler drains the todo list). When no goal agent is
+    /// configured, `--turns 0` without `--follow` stops as soon as
+    /// the active batch finishes and defers any leftover followups
+    /// to /followup. Ignored when `--turns N > 0` — the run-count
+    /// cap still wins there.
+    #[arg(long, default_value_t = false)]
+    follow: bool,
     /// Directory for all three artifact files (findings.json,
     /// report.md, todo.md). Defaults to ~/.kres/sessions/<session-id>/.
     /// Per-file flags (--findings/--report/--todo) still override.
@@ -160,6 +172,14 @@ struct ReplArgs {
     /// back to the compiled-in copy if that's missing.
     #[arg(long, value_name = "FILE")]
     template: Option<PathBuf>,
+
+    /// Render the bug report as markdown instead of plain text.
+    /// Selects the `bug-summary-markdown.md` template variant and
+    /// writes `bug-report.md` (instead of `bug-report.txt`). Pairs
+    /// with `--summary`. Ignored when `--template FILE` is passed —
+    /// an explicit template wins over the variant picker.
+    #[arg(long, default_value_t = false)]
+    markdown: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -457,10 +477,18 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         let (fast_client, fast_model, fast_max_tokens, fast_max_input) =
             kres_repl::summary::load_fast_for_summary(&fast_cfg_path, &settings)?;
         // `results_dir` is already cwd when --results was absent (see
-        // the match at the top of run_repl), so bug-report.txt lands
-        // alongside the inputs either way.
-        let output_path =
-            kres_repl::summary::default_output_path(Some(results_dir.as_path()), None);
+        // the match at the top of run_repl), so the output lands
+        // alongside the inputs either way. `--markdown` flips the
+        // default filename to bug-report.md.
+        let default_filename = if args.markdown {
+            Some("bug-report.md")
+        } else {
+            None
+        };
+        let output_path = kres_repl::summary::default_output_path(
+            Some(results_dir.as_path()),
+            default_filename,
+        );
         // Original prompt lookup: prompt.md in the results dir wins,
         // since we only ever write it there (and only when the user
         // passed --results). Nothing to read from memory in the
@@ -490,6 +518,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
             findings_path: findings_opt,
             output_path,
             template_path: args.template.clone(),
+            markdown: args.markdown,
             original_prompt,
             client: fast_client,
             model: fast_model,
@@ -559,6 +588,7 @@ async fn run_repl(args: ReplArgs) -> Result<()> {
         stop_grace: std::time::Duration::from_millis(args.stop_grace_ms),
         findings_base,
         turns_limit: args.turns,
+        follow_followups: args.follow,
         report_path: Some(report_path.clone()),
         // Only pass the explicit --results through; a defaulted
         // ~/.kres/sessions/<ts>/ dir should not trigger prompt.md

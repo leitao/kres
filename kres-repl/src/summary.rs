@@ -20,18 +20,31 @@ use kres_agents::AgentConfig;
 use kres_core::findings::FindingsFile;
 use kres_llm::{client::Client, config::CallConfig, request::Message, Model};
 
-/// Compile-time fallback copy of the bug-report template. Used when
-/// neither `SummaryInputs.template_path` nor
+/// Compile-time fallback copy of the plain-text bug-report template.
+/// Used when neither `SummaryInputs.template_path` nor
 /// `~/.kres/prompts/bug-summary.md` resolves to a readable file —
 /// keeps a freshly built kres usable on a host that hasn't run
 /// setup.sh yet.
 pub const BUG_SUMMARY_TEMPLATE: &str = include_str!("../../configs/prompts/bug-summary.md");
+
+/// Compile-time fallback for the markdown variant, selected by
+/// `--markdown`. Same content guidance, different output format
+/// (markdown with fenced code blocks instead of plain text).
+pub const BUG_SUMMARY_MARKDOWN_TEMPLATE: &str =
+    include_str!("../../configs/prompts/bug-summary-markdown.md");
 
 /// Default on-disk location for operator-editable templates. Populated
 /// by setup.sh; run_summary reads this when no explicit template path
 /// was given. Returns None when $HOME is unset.
 pub fn default_template_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".kres").join("prompts").join("bug-summary.md"))
+}
+
+/// Default on-disk location for the markdown variant of the template.
+/// `--markdown` selects this instead of the plain-text one.
+pub fn default_markdown_template_path() -> Option<PathBuf> {
+    dirs::home_dir()
+        .map(|h| h.join(".kres").join("prompts").join("bug-summary-markdown.md"))
 }
 
 /// All the inputs to one summary run. Constructed once by either the
@@ -43,8 +56,13 @@ pub struct SummaryInputs {
     /// Explicit override for the system prompt template. When Some,
     /// run_summary reads the file and errors if it cannot. When None,
     /// `~/.kres/prompts/bug-summary.md` wins if it exists; else the
-    /// compiled-in fallback is used.
+    /// compiled-in fallback is used. When `markdown` is true the
+    /// markdown variant of each resolution step is tried instead.
     pub template_path: Option<PathBuf>,
+    /// Select the markdown variant of the template + the `.md` output
+    /// filename default. Ignored when `template_path` is set (the
+    /// caller has already chosen a template).
+    pub markdown: bool,
     /// The top-level question that drove this research run. Loaded
     /// from in-REPL memory or `<results>/prompt.md`. When absent we
     /// still produce a report, just without the extra framing.
@@ -145,23 +163,39 @@ pub async fn run_summary(inputs: SummaryInputs) -> Result<()> {
     }))?;
 
     // Resolve the system prompt template: explicit --template wins,
-    // then ~/.kres/prompts/bug-summary.md, else the compiled-in copy.
+    // then the on-disk operator-editable copy in ~/.kres/prompts/, else
+    // the compiled-in copy. `--markdown` picks the markdown variant at
+    // each hop (bug-summary-markdown.md, BUG_SUMMARY_MARKDOWN_TEMPLATE).
     // Each hop logs its source so operators can tell which template
     // shaped the report.
+    let (disk_default, fallback_text, fallback_label): (
+        Option<PathBuf>,
+        &'static str,
+        &'static str,
+    ) = if inputs.markdown {
+        (
+            default_markdown_template_path(),
+            BUG_SUMMARY_MARKDOWN_TEMPLATE,
+            "<compiled-in markdown fallback>",
+        )
+    } else {
+        (
+            default_template_path(),
+            BUG_SUMMARY_TEMPLATE,
+            "<compiled-in fallback>",
+        )
+    };
     let (template_src, template_text): (String, String) = if let Some(ref p) = inputs.template_path
     {
         let text = std::fs::read_to_string(p)
             .with_context(|| format!("reading template {}", p.display()))?;
         (p.display().to_string(), text)
-    } else if let Some(p) = default_template_path().filter(|p| p.exists()) {
+    } else if let Some(p) = disk_default.filter(|p| p.exists()) {
         let text = std::fs::read_to_string(&p)
             .with_context(|| format!("reading template {}", p.display()))?;
         (p.display().to_string(), text)
     } else {
-        (
-            "<compiled-in fallback>".to_string(),
-            BUG_SUMMARY_TEMPLATE.to_string(),
-        )
+        (fallback_label.to_string(), fallback_text.to_string())
     };
     eprintln!("summary: template = {}", template_src);
 
