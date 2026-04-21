@@ -46,7 +46,9 @@ FOLLOWUPS — same schema the fast agent uses:
 - "search" — regex grep. name = pattern. add "path" to scope.
 - "file" — name = glob
 - "read" — name = "file.c:100+50"
-- "git" — readonly command string
+- "git" — git command string. Readonly subcommands plus `add` and
+  `commit` (for committing what you just wrote). `--amend` and
+  `--no-verify` are rejected; no remote-touching subcommands.
 - "bash" — `bash -c <command>` from the workspace root. `name` is
   the command; optional `timeout_secs` (default 60, cap 600) and
   `cwd` (workspace-relative). Use for compile/run verification of

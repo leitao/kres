@@ -8,7 +8,11 @@ Map each followup type to a tool:
 - "search" → use the grep tool type, NOT semcode grep_functions. Use {"type": "grep", "pattern": "REGEX", "path": "DIR"}
 - "file" → find
 - "read" → read
-- "git" → git (readonly commands only)
+- "git" → git. Readonly subcommands (log/show/diff/blame/status/...)
+  plus `add` and `commit` for coding tasks that need to commit what
+  they wrote. `--amend`, `--no-verify`, `--no-gpg-sign` are
+  rejected; `push`/`pull`/`fetch` are absent on purpose (the tool
+  is workspace-local).
 - "bash" → run `bash -c <command>` from the workspace root. Use
   {"type": "bash", "command": "cc -o hw hw.c && ./hw", "timeout_secs": 60, "cwd": "subdir"}.
   `command` is mandatory; `cmd` and `name` are accepted aliases so

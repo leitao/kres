@@ -157,14 +157,20 @@ pub async fn grep(workspace: &Path, args: &GrepArgs) -> Result<String, AgentErro
     Ok(truncate_output(&combined, TOOL_OUTPUT_CAP_GREP_FIND))
 }
 
-/// Allowed readonly git subcommands. Mirrors
-/// verbatim — the review scope was already
-/// reviewing local history via `reflog`, and `shortlog`/`cat-file`/
-/// `name-rev`/`rev-list` are load-bearing for kernel patch archaeology
-/// (who touched what, resolve a blob sha, etc.). `for-each-ref` and
-/// `status` aren't in but are useful diagnostics the agent
-/// occasionally asks for; keeping them doesn't broaden the readonly
-/// surface.
+/// Allowed git subcommands. The first tranche is the historical
+/// readonly surface used by review/analysis: `log`/`show`/`diff` for
+/// inspecting a change, `blame`/`annotate`/`shortlog` for attribution,
+/// `reflog` for local-history archaeology, `cat-file`/`ls-tree`/
+/// `ls-files`/`rev-parse`/`rev-list`/`name-rev` for object lookups,
+/// and `status`/`for-each-ref` as diagnostics.
+///
+/// The second tranche (`add`, `commit`) is the commit-flow surface —
+/// added for coding tasks that need to commit the source they just
+/// wrote. Destructive history rewrites (`--amend`), hook skipping
+/// (`--no-verify`), and signature skipping (`--no-gpg-sign`) are
+/// rejected via `reject_risky_git_flag` below, and operations that
+/// touch a remote (`push`, `pull`, `fetch`, `clone`) are deliberately
+/// absent — the tool is workspace-local.
 pub const GIT_ALLOWED: &[&str] = &[
     "log",
     "show",
@@ -185,6 +191,8 @@ pub const GIT_ALLOWED: &[&str] = &[
     "reflog",
     "status",
     "for-each-ref",
+    "add",
+    "commit",
 ];
 
 /// Per-tool output caps. grep/find truncate at 20k chars and MCP at
@@ -396,6 +404,14 @@ fn reject_risky_git_flag(arg: &str) -> Option<&'static str> {
         "--upload-pack" | "--receive-pack" => Some("specifies a remote helper to run"),
         "-P" | "--paginate" => Some("forces a pager"),
         "--help" | "-h" => Some("can invoke the man pager"),
+        // Commit-flow guards. Rewriting history (--amend) or
+        // bypassing the local tooling (--no-verify, --no-gpg-sign)
+        // is off the table for the coding tool surface: the
+        // operator's CLAUDE.md explicitly calls out that these
+        // flags should never be used by the assistant.
+        "--amend" => Some("rewrites the previous commit"),
+        "--no-verify" => Some("skips pre-commit / commit-msg hooks"),
+        "--no-gpg-sign" => Some("bypasses commit signing policy"),
         _ => None,
     }
 }
@@ -693,6 +709,9 @@ mod tests {
             "log --exec=/bin/sh",
             "log -h",
             "log --upload-pack=/bin/sh",
+            "commit --amend -m x",
+            "commit --no-verify -m x",
+            "commit --no-gpg-sign -m x",
         ] {
             let v = serde_json::json!({"command": cmd});
             let args: GitArgs = serde_json::from_value(v).unwrap();
@@ -701,6 +720,32 @@ mod tests {
             match err {
                 AgentError::Other(m) => assert!(m.contains("rejected"), "{cmd}: {m}"),
                 _ => panic!("wrong err for {cmd}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn git_allows_commit_flow_subcommands() {
+        // The allowlist and risky-flag guards live before the
+        // tokio spawn. Whatever the spawn returns (it may well
+        // error because /tmp isn't a git repo), it must NOT be
+        // the "not in allowlist" or "rejected" strings.
+        for cmd in [
+            "add README.md",
+            "commit -s -m \"msg\"",
+        ] {
+            let v = serde_json::json!({"command": cmd});
+            let args: GitArgs = serde_json::from_value(v).unwrap();
+            let res = git(std::path::Path::new("/tmp"), &args).await;
+            if let Err(AgentError::Other(m)) = &res {
+                assert!(
+                    !m.contains("not in allowlist"),
+                    "allowlist unexpectedly rejected {cmd}: {m}"
+                );
+                assert!(
+                    !m.contains("rejected:"),
+                    "risky-flag guard unexpectedly tripped on {cmd}: {m}"
+                );
             }
         }
     }
