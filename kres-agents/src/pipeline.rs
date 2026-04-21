@@ -102,6 +102,18 @@ pub struct Orchestrator {
     /// emit findings-shaped output, which the coding path ignores.
     pub slow_coding_system: Option<String>,
 
+    /// Slow-agent system prompt used when a task runs in
+    /// `TaskMode::Generic`. Loaded from
+    /// `configs/prompts/slow-code-agent-generic.system.md`. Unlike
+    /// the analysis prompt it doesn't force the "you are a deep code
+    /// analysis agent, emit findings" stance — generic tasks
+    /// answer the operator's question directly and can emit
+    /// `bash` followups for execution-style prompts. When `None`,
+    /// generic tasks fall back to `slow_system` (the operator gets
+    /// review-flavoured behaviour, which is usually fine but not
+    /// ideal for free-form questions).
+    pub slow_generic_system: Option<String>,
+
     pub fetcher: Arc<dyn DataFetcher>,
 
     /// Max rounds of fast↔main before forcing the slow agent.
@@ -502,9 +514,18 @@ impl Orchestrator {
                     self.slow_system.as_ref()
                 }
             }
-            kres_core::TaskMode::Analysis | kres_core::TaskMode::Generic => {
-                self.slow_system.as_ref()
+            kres_core::TaskMode::Generic => {
+                if self.slow_generic_system.is_some() {
+                    self.slow_generic_system.as_ref()
+                } else {
+                    // Fall back quietly — analysis prompt still
+                    // produces reasonable output for most free-form
+                    // questions, it just trends toward "audit"
+                    // phrasing.
+                    self.slow_system.as_ref()
+                }
             }
+            kres_core::TaskMode::Analysis => self.slow_system.as_ref(),
         };
         if let Some(s) = slow_system_for_call {
             cfg = cfg.with_system(s.clone());

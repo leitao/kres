@@ -214,6 +214,13 @@ pub struct Session {
     /// sessions don't have findings to summarise and the summary
     /// template would produce gibberish.
     any_coding_task: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by `/stop`; cleared by `submit_prompt` and `/continue`.
+    /// While set, the idle-loop auto-continue does not fire. Without
+    /// this latch `/stop` only cancels the currently-running tasks,
+    /// and the 5s auto-continue timer then re-dispatches whatever
+    /// was still sitting in the todo list — which is NOT what an
+    /// operator who just hit Ctrl-C's moral equivalent wants.
+    stop_latched: Arc<std::sync::atomic::AtomicBool>,
     /// §50: handles to every spawned MCP child process. On REPL
     /// exit we walk these and call `shutdown(2s)` on each so
     /// tracebacks flush cleanly instead of the child getting
@@ -308,6 +315,7 @@ impl Session {
                         interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
                         turns_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         any_coding_task: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        stop_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                         mcp_shutdown: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                     };
                 }
@@ -335,6 +343,7 @@ impl Session {
             interrupted_prompt: Arc::new(tokio::sync::Mutex::new(None)),
             turns_exhausted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             any_coding_task: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop_latched: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             mcp_shutdown: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
@@ -1361,6 +1370,10 @@ impl Session {
             println!("hint: rerun `kres repl` with agent configs to enable prompt handling");
             return;
         };
+        // Operator engaged — clear the /stop latch so auto-continue
+        // works again after this task completes.
+        self.stop_latched
+            .store(false, std::sync::atomic::Ordering::Release);
 
         // §44: inline expand any `/load <path>` substring the user
         // wove into the prompt. Matches. Multiple
@@ -1581,14 +1594,24 @@ impl Session {
 
     async fn cmd_stop(&self) {
         let out = self.mgr.stop_all(self.cfg.stop_grace).await;
+        // Latch auto-continue off until the operator explicitly
+        // resumes with /continue or submits a new prompt. Without
+        // this, /stop only killed the currently-running tasks and
+        // then the 5s idle-auto-continue redispatched whatever was
+        // still pending — which defeated the point of /stop.
+        self.stop_latched
+            .store(true, std::sync::atomic::Ordering::Release);
         println!(
-            "/stop: requested={} stopped={} grace_expired={}",
+            "/stop: requested={} stopped={} grace_expired={} (auto-continue paused; /continue or a new prompt resumes)",
             out.requested, out.stopped, out.grace_expired
         );
     }
 
     async fn cmd_continue(&self) {
         use kres_core::TodoStatus;
+        // Operator opted back in — clear the /stop auto-continue latch.
+        self.stop_latched
+            .store(false, std::sync::atomic::Ordering::Release);
         // §22: an interrupted inference wins over batch dispatch.
         // Re-submit the stashed prompt and return — the operator
         // gets their work back before new items start.
@@ -2040,6 +2063,15 @@ impl Session {
     /// pending item whose deps are satisfied.
     async fn should_auto_continue(&self) -> bool {
         use kres_core::TodoStatus;
+        // /stop parks the latch. The operator has to re-consent
+        // (via /continue or a new prompt) before auto-continue
+        // resumes.
+        if self
+            .stop_latched
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
         let running = self.mgr.active_count().await;
         if running > 0 {
             return false;
@@ -2153,6 +2185,15 @@ impl Session {
 pub const SLOW_CODING_SYSTEM: &str =
     include_str!("../../configs/prompts/slow-code-agent-coding.system.md");
 
+/// Compile-time fallback for the generic-mode slow-agent system
+/// prompt. The generic prompt is less opinionated than the
+/// review/analysis prompt — it tells the slow agent to answer the
+/// operator's question directly and use the full followup tool
+/// surface (including bash) instead of forcing an "audit some code"
+/// stance on every single-call task.
+pub const SLOW_GENERIC_SYSTEM: &str =
+    include_str!("../../configs/prompts/slow-code-agent-generic.system.md");
+
 /// Load the coding-mode system prompt: prefer the operator-editable
 /// copy in `~/.kres/prompts/`, fall back to the compiled-in version.
 /// Returns `None` only when $HOME is unset AND the file isn't readable
@@ -2172,6 +2213,24 @@ fn load_slow_coding_system() -> Option<String> {
         }
     }
     Some(SLOW_CODING_SYSTEM.to_string())
+}
+
+/// Load the generic-mode system prompt. Same resolution order as
+/// `load_slow_coding_system`: `~/.kres/prompts/` wins when present,
+/// otherwise the compiled-in SLOW_GENERIC_SYSTEM.
+fn load_slow_generic_system() -> Option<String> {
+    if let Some(home) = dirs::home_dir() {
+        let p = home
+            .join(".kres")
+            .join("prompts")
+            .join("slow-code-agent-generic.system.md");
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if !s.trim().is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    Some(SLOW_GENERIC_SYSTEM.to_string())
 }
 
 /// Convenience: build an Orchestrator from paths to agent configs and
@@ -2271,6 +2330,7 @@ pub async fn build_orchestrator(
     });
 
     let slow_coding_system = load_slow_coding_system();
+    let slow_generic_system = load_slow_generic_system();
     let orchestrator = Arc::new(Orchestrator {
         fast_client,
         fast_model: fast_model.clone(),
@@ -2283,6 +2343,7 @@ pub async fn build_orchestrator(
         slow_max_tokens: slow_cfg.max_tokens.unwrap_or(slow_model.max_output_tokens),
         slow_max_input_tokens: slow_cfg.max_input_tokens,
         slow_coding_system,
+        slow_generic_system,
         fetcher,
         max_fast_rounds: gather_turns,
         skills,
