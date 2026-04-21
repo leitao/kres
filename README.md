@@ -71,37 +71,98 @@ safety, bounds checks, races, and general bugs in the named code.
 Drop a new `<word>-template.md` in `~/.kres/prompts/` to add your
 own prompt templates.
 
+Note: the template is invoked because the prompt has 'review:'.  If you just
+wrote 'review', the template would not be loaded.
+
+### Parallel lenses inside `review-template.md`
+
+The shipped template is more than a prose prompt — each of its
+markdown todo bullets is a **lens**:
+
+```
+- [ ] **[investigate]** object lifetime: #lifetime
+- [ ] **[investigate]** memory allocations: #memory
+- [ ] **[investigate]** bounds checks ... #bounds
+- [ ] **[investigate]** races: #races
+- [ ] **[investigate]** general: #general
+```
+(`configs/prompts/review-template.md`)
+
+`kres_agents::parse_prompt_file`
+(`kres-agents/src/prompt_file.rs:28-98`) turns each bullet into a
+`LensSpec` (id, kind, name, reason) and installs them as
+**session-wide lenses**. For every task, kres then fans out one
+slow-agent call per lens over the *same* gathered symbols and
+source sections — five parallel analyses in the case of the shipped
+template — and runs a consolidator pass that dedupes the findings
+across lenses before the merger folds them into the cumulative
+list (`kres-core/src/lens.rs:1-7`).
+
+That parallelism is what makes a single `review:` run productive:
+instead of the slow agent juggling lifetime + memory + bounds +
+races + general bugs in one response, each angle gets its own
+focused call with the full context, and overlap between findings
+is resolved at consolidation time. Indented sub-bullets under a
+lens bullet fold into its `reason` field and become extra guidance
+the slow agent sees on that specific lens (see the sub-bullets
+under `object lifetime` and `memory allocations` in the template).
+
+To add or remove angles for your own reviews, edit the bullets in
+`~/.kres/prompts/review-template.md`, or drop a whole new
+`<word>-template.md` with its own lens set.
+
 `--results review` tells kres where to keep the run's artifacts:
 `findings.json` (plus `findings-N.json` history snapshots), the
 running narrative `report.md`, and the rendered `bug-report.txt`
 when `/summary` fires. Without `--results`, kres picks
 `~/.kres/sessions/<timestamp>/` automatically.
 
-## `--turns`: stopping the run
+## `--turns` and `--follow`: stopping the run
 
-By default kres keeps the REPL open indefinitely — you drive work
-interactively via slash commands. `--turns N` gives you a
-time-boxed non-interactive run:
+`--turns` controls when kres decides a non-interactive run is "done".
+A "completed task" throughout this section means a unit that ran all
+the way through fast → main → slow and produced a non-empty analysis
+(`kres-core/src/task.rs:309-311`).
 
-- `--turns 0` — the default. No auto-stop; the REPL runs until you
-  `/quit` or `ctrl-c` out.
-- `--turns 1` — stop after the first completed task. Useful for a
-  single focused question where you just want the answer.
-- `--turns N` — stop after N completed tasks. A "completed task" is
-  a unit that ran all the way through fast → main (data gather) →
-  slow and produced findings. Most meaningful reviews want N ≥ 2 so
-  the todo list (populated after task 1) actually gets drained.
+- **`--turns N` (N ≥ 1)** — stop after N completed tasks. Useful for
+  a single focused question (`--turns 1`) or a time-boxed review
+  (`--turns 5` etc.). The REPL exits as soon as the Nth task
+  finishes, regardless of what the goal agent or the followup queue
+  look like. `--follow` has no effect in this mode; the run-count
+  cap wins.
 
-When kres hits the cap it
+- **`--turns 0` (the default)** — no run-count cap. kres trusts the
+  goal agent: after every task the goal agent checks the accumulated
+  analysis against the per-task goal; when it declares the goal met,
+  its handler drains the todo list and the reaper exits on the next
+  tick (nothing is active, nothing is pending). Until then kres
+  keeps dispatching the followup tasks the goal check spawns.
+
+  - Add `--follow` to layer a cost cap on top: if 3 consecutive
+    analysis-producing runs fail to grow the findings list, exit
+    even if the goal agent is still saying "not met". Use this when
+    you want a hard ceiling on how long kres will keep pulling on
+    threads.
+
+  (`kres-repl/src/session.rs` — see the `turns_limit == 0` branch in
+  the reaper for the exact predicates. If you run without a
+  `main-agent.json`, no goal agent is wired up and kres falls back
+  to "stop when the active batch finishes"; `--follow` switches that
+  fallback to "drain the todo list with the 3-run stagnation cap".)
+
+On any `--turns` exit path — run-count cap, goal-met drain, or
+stagnation cap — kres
 
 1. cancels any in-flight work,
-2. runs `/summary` automatically, producing `bug-report.txt` in the
-   results directory (or the current working directory when no
-   `--results` was given), and
+2. runs `/summary` automatically, producing `bug-report.txt`
+   (`bug-report.md` with `--markdown`) in the results directory, or
+   in the current working directory when `--results` was not given,
+   and
 3. exits.
 
 Remaining pending or blocked todo items are moved to the "deferred"
-list; `/followup` shows them if you re-enter the REPL later.
+list; `/followup` shows them if you re-enter the REPL later, and
+`/continue` will dispatch them.
 
 ## Flow of work between the agents
 
@@ -196,6 +257,94 @@ At the end of a run you get a plain-text bug report via `/summary`
 
 You can point `--template PATH` at a custom file to override the
 shipped summariser prompt without rebuilding.
+
+## Review prompts
+
+kres can leverage the kernel review prompts for additional subsystem knowledge.
+These live in a separate repo:
+
+https://github.com/masoncl/review-prompts
+
+The shipped kernel skill (`skills/kernel.md`) is a thin loader: it
+references `@REVIEW_PROMPTS@/kernel/technical-patterns.md` as a
+mandatory read on every slow-agent turn, plus
+`@REVIEW_PROMPTS@/kernel/subsystem/subsystem.md` as an index into
+per-subsystem guides. `setup.sh` substitutes `@REVIEW_PROMPTS@` with
+an on-disk path at install time (see `skills/kernel.md:8`,
+`skills/kernel.md:17`, `skills/kernel.md:29`).
+
+Point `setup.sh` at your clone so the skill can resolve those files:
+
+```
+./setup.sh --fast-key $FAST_API_KEY --slow-key $SLOW_API_KEY \
+           --review-prompts /path/to/review-prompts
+```
+
+Without a resolvable path, `setup.sh` leaves the kernel skill
+uninstalled (`setup.sh:386-389`) — the agents will still run, but the
+slow agent won't have the pattern catalogue or subsystem context, so
+findings tend to be shallower and miss conventions that are obvious
+to someone who has read the pattern files.
+
+If a path wasn't given explicitly, `setup.sh` peeks at
+`~/.claude/skills/kernel/SKILL.md` and offers the first
+`review-prompts` path it finds there (`setup.sh:338-372`); pass
+`--review-prompts PATH` explicitly to bypass the prompt.
+
+## semcode
+
+The main agent's code-navigation and seawrching can be enhanced by semcode:
+server:
+
+https://github.com/facebookexperimental/semcode
+
+When a `semcode-mcp` binary is installed, `setup.sh` writes an
+`mcp.json` that launches it as an MCP child:
+
+```
+{
+  "mcpServers": {
+    "semcode": { "command": "semcode-mcp" }
+  }
+}
+```
+
+(`configs/mcp.json`).
+
+kres works without semcode — the main agent can already answer code
+questions with `read`, `grep`, and `git` against the workspace
+(`CLAUDE.md:9,16`). When semcode is available, the main agent gets a
+function/type/callchain-aware index to ask instead of deriving the
+same information from raw regex.
+
+Tools semcode exposes that the main agent will call when wired up:
+
+- Function- and type-level lookups: `find_function`, `find_type`,
+  `find_callers`, `find_calls`, `find_callchain`, `grep_functions`.
+- Commit- and branch-level helpers: `find_commit`,
+  `compare_branches`, `diff_functions`, `list_branches`.
+- Vector-indexed search: `vgrep_functions`,
+  `vcommit_similar_commits`, `vlore_similar_emails`, `lore_search`.
+
+Raw semcode symbol text is normalised back into a uniform JSON
+shape by `parse_semcode_symbol` (`kres-agents/src/symbol.rs:52-59`)
+before reaching the fast/slow agents.
+
+**When it helps**: whole-program questions that read/grep can only
+approximate — "who calls `btrfs_search_slot`", "what does the
+definition of `struct inode` look like on this branch", "show me
+every change to this function in the last 1000 commits". Without
+semcode the main agent still answers those, just via more grep
+round-trips with more false positives.
+
+**Install**: either drop `semcode-mcp` on your `PATH` before running
+`setup.sh` (it auto-installs `mcp.json`, `setup.sh:265-269`) or pass
+`--semcode PATH/TO/semcode-mcp` explicitly (`setup.sh:41-45`).
+`--semcode ""` force-skips the MCP install even when the binary is
+on `PATH`. kres's `.gitignore` excludes a `/.semcode.db/` directory
+at the repo root (`.gitignore:4`) — that's semcode's on-disk index
+cache; consult the semcode repo for details on how it's populated
+and invalidated.
 
 ## Config directory: `~/.kres/`
 
